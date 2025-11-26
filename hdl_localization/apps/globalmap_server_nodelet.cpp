@@ -115,7 +115,7 @@ private:
     pcl::toROSMsg(*globalmap, *globalmap_msg);
 
     globalmap_pub->publish(*globalmap_msg);
-    // globalmap_pub_timer.reset();
+    globalmap_pub_timer.reset();  // Stop timer after first publish
   }
 
 private:

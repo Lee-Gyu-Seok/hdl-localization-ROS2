@@ -204,6 +204,14 @@ private:
     imu_data.push_back(imu_msg);
   }
 
+  // Helper function to remove leading slash from frame_id (TF2 requirement)
+  std::string sanitize_frame_id(const std::string& frame_id) {
+    if (!frame_id.empty() && frame_id[0] == '/') {
+      return frame_id.substr(1);
+    }
+    return frame_id;
+  }
+
   void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
     // RCLCPP_INFO(get_logger(), "");
     // RCLCPP_INFO(get_logger(), "points_callback");
@@ -225,6 +233,9 @@ private:
     // point_msg의 sensor_msg/pointCloud2 type을 pcl_cloud type으로 형변환
     // sensor_msg/pointCloud2 -> pcl::PointCloud<PointT>
     pcl::fromROSMsg(*points_msg, *pcl_cloud);
+
+    // Sanitize frame_id (remove leading slash for TF2 compatibility)
+    pcl_cloud->header.frame_id = sanitize_frame_id(pcl_cloud->header.frame_id);
 
     if (pcl_cloud->empty()) {
       RCLCPP_ERROR(get_logger(), "cloud is empty!!");
