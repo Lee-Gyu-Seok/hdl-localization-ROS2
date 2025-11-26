@@ -112,6 +112,11 @@ def generate_launch_description():
                     {"use_imu": use_imu},
                     {"invert_acc": invert_imu_acc},
                     {"invert_gyro": invert_imu_gyro},
+                    # IMU noise covariance (from FAST-LIVO calibration)
+                    {"acc_cov": 0.5},      # accelerometer noise covariance
+                    {"gyr_cov": 0.3},      # gyroscope noise covariance
+                    {"b_acc_cov": 0.0001}, # accelerometer bias noise covariance
+                    {"b_gyr_cov": 0.0001}, # gyroscope bias noise covariance
                     # Timing
                     {"cool_time_duration": 2.0},
                     # Odometry prediction

@@ -37,13 +37,21 @@ public:
    * @param pos                 initial position
    * @param quat                initial orientation
    * @param cool_time_duration  during "cool time", prediction is not performed
+   * @param acc_cov             accelerometer noise covariance
+   * @param gyr_cov             gyroscope noise covariance
+   * @param b_acc_cov           accelerometer bias noise covariance
+   * @param b_gyr_cov           gyroscope bias noise covariance
    */
   PoseEstimator(
     pcl::Registration<PointT, PointT>::Ptr& registration,
     const rclcpp::Time& stamp,
     const Eigen::Vector3f& pos,
     const Eigen::Quaternionf& quat,
-    double cool_time_duration = 1.0);
+    double cool_time_duration = 1.0,
+    double acc_cov = 0.5,
+    double gyr_cov = 0.3,
+    double b_acc_cov = 0.0001,
+    double b_gyr_cov = 0.0001);
   ~PoseEstimator();
 
   /**

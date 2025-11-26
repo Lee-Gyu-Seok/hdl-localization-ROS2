@@ -14,8 +14,13 @@ namespace hdl_localization {
  * @param pos                 initial position
  * @param quat                initial orientation
  * @param cool_time_duration  during "cool time", prediction is not performed
+ * @param acc_cov             accelerometer noise covariance
+ * @param gyr_cov             gyroscope noise covariance
+ * @param b_acc_cov           accelerometer bias noise covariance
+ * @param b_gyr_cov           gyroscope bias noise covariance
  */
-PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registration, const rclcpp::Time& stamp, const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat, double cool_time_duration)
+PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registration, const rclcpp::Time& stamp, const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat, double cool_time_duration,
+    double acc_cov, double gyr_cov, double b_acc_cov, double b_gyr_cov)
     : init_stamp(stamp), registration(registration), cool_time_duration(cool_time_duration) {
 
   prev_stamp = rclcpp::Time((int64_t)0, init_stamp.get_clock_type());
@@ -23,12 +28,14 @@ PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registratio
   last_observation.block<3, 3>(0, 0) = quat.toRotationMatrix();
   last_observation.block<3, 1>(0, 3) = pos;
 
+  // Process noise matrix (16x16 for UKF state)
+  // State: [pos(3), vel(3), quat(4), acc_bias(3), gyro_bias(3)]
   process_noise = Eigen::MatrixXf::Identity(16, 16);
-  process_noise.middleRows(0, 3) *= 1.0;
-  process_noise.middleRows(3, 3) *= 1.0;
-  process_noise.middleRows(6, 4) *= 0.5;
-  process_noise.middleRows(10, 3) *= 1e-6;
-  process_noise.middleRows(13, 3) *= 1e-6;
+  process_noise.middleRows(0, 3) *= 1.0;           // position noise
+  process_noise.middleRows(3, 3) *= acc_cov;       // velocity noise (affected by accelerometer)
+  process_noise.middleRows(6, 4) *= gyr_cov;       // orientation noise (affected by gyroscope)
+  process_noise.middleRows(10, 3) *= b_acc_cov;    // accelerometer bias noise
+  process_noise.middleRows(13, 3) *= b_gyr_cov;    // gyroscope bias noise
 
   Eigen::MatrixXf measurement_noise = Eigen::MatrixXf::Identity(7, 7);
   measurement_noise.middleRows(0, 3) *= 0.01;

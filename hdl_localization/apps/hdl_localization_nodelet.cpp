@@ -57,6 +57,12 @@ public:
     use_imu = declare_parameter<bool>("use_imu", true);
     invert_acc = declare_parameter<bool>("invert_acc", false);
     invert_gyro = declare_parameter<bool>("invert_gyro", false);
+
+    // IMU noise covariance parameters
+    acc_cov = declare_parameter<double>("acc_cov", 0.5);
+    gyr_cov = declare_parameter<double>("gyr_cov", 0.3);
+    b_acc_cov = declare_parameter<double>("b_acc_cov", 0.0001);
+    b_gyr_cov = declare_parameter<double>("b_gyr_cov", 0.0001);
     if (use_imu) {
       RCLCPP_INFO(get_logger(), "enable imu-based prediction");
       imu_sub = create_subscription<sensor_msgs::msg::Imu>("/gpsimu_driver/imu_data", 256, std::bind(&HdlLocalizationNodelet::imu_callback, this, std::placeholders::_1));
@@ -171,6 +177,7 @@ private:
     bool specify_init_pose = declare_parameter<bool>("specify_init_pose", true);
     if (specify_init_pose) {
       RCLCPP_INFO(get_logger(), "initialize pose estimator with specified parameters!!");
+      RCLCPP_INFO(get_logger(), "IMU covariance - acc: %.4f, gyr: %.4f, b_acc: %.6f, b_gyr: %.6f", acc_cov, gyr_cov, b_acc_cov, b_gyr_cov);
       pose_estimator.reset(new hdl_localization::PoseEstimator(
         registration,
         get_clock()->now(),
@@ -180,7 +187,11 @@ private:
           declare_parameter<double>("init_ori_x", 0.0),
           declare_parameter<double>("init_ori_y", 0.0),
           declare_parameter<double>("init_ori_z", 0.0)),
-        cool_time_duration));
+        cool_time_duration,
+        acc_cov,
+        gyr_cov,
+        b_acc_cov,
+        b_gyr_cov));
     }
   }
 
@@ -382,7 +393,8 @@ private:
 
     std::lock_guard<std::mutex> lock(pose_estimator_mutex);
     pose_estimator.reset(
-      new hdl_localization::PoseEstimator(registration, get_clock()->now(), Eigen::Vector3f(pose.translation()), Eigen::Quaternionf(pose.linear()), cool_time_duration));
+      new hdl_localization::PoseEstimator(registration, get_clock()->now(), Eigen::Vector3f(pose.translation()), Eigen::Quaternionf(pose.linear()), cool_time_duration,
+        acc_cov, gyr_cov, b_acc_cov, b_gyr_cov));
 
     relocalizing = false;
 
@@ -399,7 +411,8 @@ private:
     const auto& p = pose_msg->pose.pose.position;
     const auto& q = pose_msg->pose.pose.orientation;
     pose_estimator.reset(
-      new hdl_localization::PoseEstimator(registration, get_clock()->now(), Eigen::Vector3f(p.x, p.y, p.z), Eigen::Quaternionf(q.w, q.x, q.y, q.z), cool_time_duration));
+      new hdl_localization::PoseEstimator(registration, get_clock()->now(), Eigen::Vector3f(p.x, p.y, p.z), Eigen::Quaternionf(q.w, q.x, q.y, q.z), cool_time_duration,
+        acc_cov, gyr_cov, b_acc_cov, b_gyr_cov));
   }
 
   pcl::PointCloud<PointT>::ConstPtr downsample(const pcl::PointCloud<PointT>::ConstPtr& cloud) const {
@@ -572,6 +585,12 @@ private:
   double ndt_neighbor_search_radius;
   double ndt_resolution;
   bool enable_robot_odometry_prediction;
+
+  // IMU noise covariance parameters
+  double acc_cov;
+  double gyr_cov;
+  double b_acc_cov;
+  double b_gyr_cov;
 };
 }  // namespace hdl_localization
 
