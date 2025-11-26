@@ -37,9 +37,10 @@ PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registratio
   process_noise.middleRows(10, 3) *= b_acc_cov;    // accelerometer bias noise
   process_noise.middleRows(13, 3) *= b_gyr_cov;    // gyroscope bias noise
 
+  // Measurement noise - lower values = trust NDT measurement more
   Eigen::MatrixXf measurement_noise = Eigen::MatrixXf::Identity(7, 7);
-  measurement_noise.middleRows(0, 3) *= 0.01;
-  measurement_noise.middleRows(3, 4) *= 0.001;
+  measurement_noise.middleRows(0, 3) *= 0.001;  // Position: trust NDT strongly
+  measurement_noise.middleRows(3, 4) *= 0.0001; // Orientation: trust NDT strongly
 
   Eigen::VectorXf mean(16);
   mean.middleRows(0, 3) = pos;
@@ -48,7 +49,8 @@ PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registratio
   mean.middleRows(10, 3).setZero();
   mean.middleRows(13, 3).setZero();
 
-  Eigen::MatrixXf cov = Eigen::MatrixXf::Identity(16, 16) * 0.01;
+  // Initial state covariance - higher = more uncertainty, will trust measurements more
+  Eigen::MatrixXf cov = Eigen::MatrixXf::Identity(16, 16) * 1.0;
 
   PoseSystem system;
   ukf.reset(new kkl::alg::UnscentedKalmanFilterX<float, PoseSystem>(system, 16, 6, 7, process_noise, measurement_noise, mean, cov));
@@ -143,6 +145,8 @@ void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
  * @return cloud aligned to the globalmap
  */
 pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud) {
+  // Save previous correction stamp for velocity calculation
+  rclcpp::Time prev_correction_stamp = last_correction_stamp;
   last_correction_stamp = stamp;
 
   Eigen::Matrix4f no_guess = last_observation;
@@ -151,7 +155,9 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
 
   if(!odom_ukf) {
-    init_guess = imu_guess = matrix();
+    // Use last NDT observation as init_guess for stability
+    // UKF prediction diverges too much from NDT, causing NDT to fail
+    init_guess = last_observation;
   } else {
     imu_guess = matrix();
     odom_guess = odom_matrix();
@@ -203,6 +209,25 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   wo_pred_error = no_guess.inverse() * registration->getFinalTransformation();
 
   ukf->correct(observation);
+
+  // Update velocity estimate using NDT position difference
+  // This helps the UKF velocity converge since NDT only observes position/orientation
+  // Check if prev_correction_stamp is valid (nanoseconds > 0 means it has been set)
+  if(prev_correction_stamp.nanoseconds() > 0) {
+    double dt = (stamp - prev_correction_stamp).seconds();
+    if(dt > 0.01 && dt < 1.0) {  // Valid time range (10ms ~ 1s)
+      Eigen::Vector3f prev_pos = no_guess.block<3, 1>(0, 3);
+      Eigen::Vector3f ndt_velocity = (p - prev_pos) / dt;
+
+      // Blend NDT-derived velocity with UKF velocity estimate
+      // Use higher weight on NDT velocity to help convergence
+      float alpha = 0.7f;  // NDT velocity weight
+      ukf->mean[3] = alpha * ndt_velocity[0] + (1.0f - alpha) * ukf->mean[3];
+      ukf->mean[4] = alpha * ndt_velocity[1] + (1.0f - alpha) * ukf->mean[4];
+      ukf->mean[5] = alpha * ndt_velocity[2] + (1.0f - alpha) * ukf->mean[5];
+    }
+  }
+
   imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
 
   if(odom_ukf) {

@@ -46,7 +46,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time", default="false")
 
     # IMU settings
-    use_imu = LaunchConfiguration("use_imu", default="true")
+    use_imu = LaunchConfiguration("use_imu", default="true")  # Enabled
     invert_imu_acc = LaunchConfiguration("invert_imu_acc", default="false")
     invert_imu_gyro = LaunchConfiguration("invert_imu_gyro", default="false")
 
@@ -119,12 +119,11 @@ def generate_launch_description():
                 package="hdl_localization",
                 plugin="hdl_localization::HdlLocalizationNodelet",
                 name="hdl_localization",
-                remappings=[
-                    ("/velodyne_points", points_topic),
-                    ("/gpsimu_driver/imu_data", imu_topic),
-                ],
                 parameters=[
                     {"odom_child_frame_id": odom_child_frame_id},
+                    # Topic names
+                    {"points_topic": points_topic},
+                    {"imu_topic": imu_topic},
                     # IMU settings
                     {"use_imu": use_imu},
                     {"invert_acc": invert_imu_acc},
@@ -143,10 +142,10 @@ def generate_launch_description():
                     # Available: NDT_OMP, NDT_CUDA_P2D, NDT_CUDA_D2D
                     {"reg_method": "NDT_OMP"},
                     {"ndt_neighbor_search_method": "DIRECT7"},
-                    {"ndt_neighbor_search_radius": 1.0},
-                    {"ndt_resolution": 0.5},
+                    {"ndt_neighbor_search_radius": 2.0},
+                    {"ndt_resolution": 1.0},  # Balance between precision and speed
                     # Downsampling
-                    {"downsample_resolution": 0.1},
+                    {"downsample_resolution": 0.2},  # Sparser for faster computation
                     # Initial pose: (0, 0, 0) facing forward
                     {"specify_init_pose": True},
                     {"init_pos_x": 0.0},

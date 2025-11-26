@@ -63,11 +63,17 @@ public:
     gyr_cov = declare_parameter<double>("gyr_cov", 0.3);
     b_acc_cov = declare_parameter<double>("b_acc_cov", 0.0001);
     b_gyr_cov = declare_parameter<double>("b_gyr_cov", 0.0001);
+
+    // Topic names (configurable via parameters)
+    std::string points_topic = declare_parameter<std::string>("points_topic", "/velodyne_points");
+    std::string imu_topic = declare_parameter<std::string>("imu_topic", "/gpsimu_driver/imu_data");
+
     if (use_imu) {
-      RCLCPP_INFO(get_logger(), "enable imu-based prediction");
-      imu_sub = create_subscription<sensor_msgs::msg::Imu>("/gpsimu_driver/imu_data", 256, std::bind(&HdlLocalizationNodelet::imu_callback, this, std::placeholders::_1));
+      RCLCPP_INFO(get_logger(), "enable imu-based prediction, subscribing to: %s", imu_topic.c_str());
+      imu_sub = create_subscription<sensor_msgs::msg::Imu>(imu_topic, 256, std::bind(&HdlLocalizationNodelet::imu_callback, this, std::placeholders::_1));
     }
-    points_sub = create_subscription<sensor_msgs::msg::PointCloud2>("/velodyne_points", 5, std::bind(&HdlLocalizationNodelet::points_callback, this, std::placeholders::_1));
+    points_sub = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 5, std::bind(&HdlLocalizationNodelet::points_callback, this, std::placeholders::_1));
+    RCLCPP_INFO(get_logger(), "subscribing to points topic: %s", points_topic.c_str());
 
     auto latch_qos = 10;  // rclcpp::QoS(1).transient_local();
     globalmap_sub =
@@ -109,7 +115,8 @@ private:
     if (reg_method == "NDT_OMP") {
       RCLCPP_INFO(get_logger(), "NDT_OMP is selected");
       pclomp::NormalDistributionsTransform<PointT, PointT>::Ptr ndt(new pclomp::NormalDistributionsTransform<PointT, PointT>());
-      ndt->setTransformationEpsilon(0.01);
+      ndt->setTransformationEpsilon(0.01);   // Convergence threshold
+      ndt->setMaximumIterations(30);         // Balanced iterations for 20Hz input
       ndt->setResolution(ndt_resolution);
       if (ndt_neighbor_search_method == "DIRECT1") {
         RCLCPP_INFO(get_logger(), "search_method DIRECT1 is selected");
@@ -309,9 +316,32 @@ private:
       }
     }
 
-    // 문제가 되는 구문
     // correct
+    Eigen::Matrix4f before_correct = pose_estimator->matrix();
     auto aligned = pose_estimator->correct(stamp, filtered);
+    Eigen::Matrix4f after_correct = pose_estimator->matrix();
+
+    // Get raw NDT result
+    Eigen::Matrix4f ndt_result = registration->getFinalTransformation();
+    Eigen::Vector3f ndt_pos = ndt_result.block<3, 1>(0, 3);
+
+    // Debug: print NDT result - every 500ms to track movement
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+      "NDT: (%.3f, %.3f, %.3f), score: %.4f, converged: %d, pts: %zu",
+      ndt_pos.x(), ndt_pos.y(), ndt_pos.z(),
+      registration->getFitnessScore(), registration->hasConverged(),
+      filtered->size());
+
+    // Debug: Compare UKF prediction (before_correct) vs actual NDT result
+    Eigen::Vector3f ukf_pred_pos = before_correct.block<3, 1>(0, 3);
+    Eigen::Vector3f ukf_vel = pose_estimator->vel();
+    Eigen::Vector3f pred_error = ndt_pos - ukf_pred_pos;
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+      "UKF pred: (%.3f, %.3f, %.3f), vel: (%.3f, %.3f, %.3f), pred_err: (%.3f, %.3f, %.3f)",
+      ukf_pred_pos.x(), ukf_pred_pos.y(), ukf_pred_pos.z(),
+      ukf_vel.x(), ukf_vel.y(), ukf_vel.z(),
+      pred_error.x(), pred_error.y(), pred_error.z());
+
 
     if (aligned_pub->get_subscription_count()) {
       aligned->header.frame_id = "map";
@@ -325,7 +355,9 @@ private:
       publish_scan_matching_status(points_msg->header, aligned);
     }
 
-    publish_odometry(points_msg->header.stamp, pose_estimator->matrix());
+    // Use NDT result directly for odometry output
+    // UKF is still updated internally but its prediction diverges too much
+    publish_odometry(points_msg->header.stamp, ndt_result);
 
     // RCLCPP_INFO(get_logger(), "");
     // RCLCPP_INFO(get_logger(), "----------finish points callback------------");
