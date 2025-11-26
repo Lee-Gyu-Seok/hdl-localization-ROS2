@@ -1,3 +1,6 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.substitutions import LaunchConfiguration
 
@@ -82,6 +85,20 @@ def generate_launch_description():
         ],
     )
 
+    # RViz
+    rviz_config = os.path.join(
+        get_package_share_directory("hdl_localization"),
+        "rviz",
+        "hdl_localization_ros2.rviz"
+    )
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        arguments=["-d", rviz_config],
+        output="screen",
+    )
+
     container = ComposableNodeContainer(
         name="hdl_localization_container",
         namespace="",
@@ -154,5 +171,6 @@ def generate_launch_description():
             lidar_imu_tf,
             map_odom_tf,
             container,
+            rviz_node,
         ]
     )
