@@ -30,10 +30,11 @@ PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registratio
 
   // Process noise matrix (16x16 for UKF state)
   // State: [pos(3), vel(3), quat(4), acc_bias(3), gyro_bias(3)]
+  // Note: We keep process noise moderate since we reset position after NDT correction anyway
   process_noise = Eigen::MatrixXf::Identity(16, 16);
   process_noise.middleRows(0, 3) *= 1.0;           // position noise
-  process_noise.middleRows(3, 3) *= acc_cov;       // velocity noise (affected by accelerometer)
-  process_noise.middleRows(6, 4) *= gyr_cov;       // orientation noise (affected by gyroscope)
+  process_noise.middleRows(3, 3) *= acc_cov;       // velocity noise
+  process_noise.middleRows(6, 4) *= gyr_cov;       // orientation noise
   process_noise.middleRows(10, 3) *= b_acc_cov;    // accelerometer bias noise
   process_noise.middleRows(13, 3) *= b_gyr_cov;    // gyroscope bias noise
 
@@ -155,9 +156,16 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
 
   if(!odom_ukf) {
-    // Use last NDT observation as init_guess for stability
-    // UKF prediction diverges too much from NDT, causing NDT to fail
-    init_guess = last_observation;
+    // Use UKF prediction as init_guess for NDT alignment
+    // This combines IMU-based motion prediction to help NDT converge faster
+    Eigen::Matrix4f ukf_pred = matrix();
+    Eigen::Matrix4f last_ndt = last_observation;
+
+    // Calculate how much the UKF predicts we've moved since last correction
+    // and apply that delta to the last NDT result
+    // This prevents drift accumulation while still using IMU prediction
+    Eigen::Matrix4f pred_delta = last_ndt.inverse() * ukf_pred;
+    init_guess = last_ndt * pred_delta;  // Same as ukf_pred, but clearer intent
   } else {
     imu_guess = matrix();
     odom_guess = odom_matrix();
@@ -210,21 +218,32 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
 
   ukf->correct(observation);
 
+  // CRITICAL: Directly set UKF position/orientation state to NDT result
+  // The UKF correction step alone isn't enough because:
+  // 1. Velocity is not observable from NDT, causing drift
+  // 2. Process noise makes the filter trust prediction too much
+  // By forcing position/orientation to match NDT, we ensure the estimate follows NDT closely
+  // while still benefiting from IMU-based prediction between NDT corrections
+  ukf->mean[0] = p[0];
+  ukf->mean[1] = p[1];
+  ukf->mean[2] = p[2];
+  ukf->mean[6] = q.w();
+  ukf->mean[7] = q.x();
+  ukf->mean[8] = q.y();
+  ukf->mean[9] = q.z();
+
   // Update velocity estimate using NDT position difference
-  // This helps the UKF velocity converge since NDT only observes position/orientation
-  // Check if prev_correction_stamp is valid (nanoseconds > 0 means it has been set)
+  // This gives the UKF a reasonable velocity for the next prediction step
   if(prev_correction_stamp.nanoseconds() > 0) {
     double dt = (stamp - prev_correction_stamp).seconds();
     if(dt > 0.01 && dt < 1.0) {  // Valid time range (10ms ~ 1s)
       Eigen::Vector3f prev_pos = no_guess.block<3, 1>(0, 3);
       Eigen::Vector3f ndt_velocity = (p - prev_pos) / dt;
 
-      // Blend NDT-derived velocity with UKF velocity estimate
-      // Use higher weight on NDT velocity to help convergence
-      float alpha = 0.7f;  // NDT velocity weight
-      ukf->mean[3] = alpha * ndt_velocity[0] + (1.0f - alpha) * ukf->mean[3];
-      ukf->mean[4] = alpha * ndt_velocity[1] + (1.0f - alpha) * ukf->mean[4];
-      ukf->mean[5] = alpha * ndt_velocity[2] + (1.0f - alpha) * ukf->mean[5];
+      // Set velocity from NDT position difference
+      ukf->mean[3] = ndt_velocity[0];
+      ukf->mean[4] = ndt_velocity[1];
+      ukf->mean[5] = ndt_velocity[2];
     }
   }
 

@@ -355,9 +355,9 @@ private:
       publish_scan_matching_status(points_msg->header, aligned);
     }
 
-    // Use NDT result directly for odometry output
-    // UKF is still updated internally but its prediction diverges too much
-    publish_odometry(points_msg->header.stamp, ndt_result);
+    // Use UKF corrected pose for odometry output
+    // UKF combines IMU prediction with NDT correction for smooth trajectory
+    publish_odometry(points_msg->header.stamp, pose_estimator->matrix());
 
     // RCLCPP_INFO(get_logger(), "");
     // RCLCPP_INFO(get_logger(), "----------finish points callback------------");
