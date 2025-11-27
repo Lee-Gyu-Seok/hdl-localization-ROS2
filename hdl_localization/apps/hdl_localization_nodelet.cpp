@@ -1,7 +1,14 @@
-// hdl localizaton ROS2 코드 1
+// hdl localizaton ROS2 - Multi-rate sensor fusion architecture
+// IMU (100-400Hz) -> UKF prediction
+// LiDAR GICP (10-20Hz) -> frame-to-frame odometry -> UKF correction
+// NDT (1-2Hz) -> global map alignment -> UKF correction (drift reset)
+
 #include <mutex>
 #include <memory>
 #include <iostream>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 
 #include <rclcpp/rclcpp.hpp>
 #include <pcl_ros/transforms.hpp>
@@ -20,6 +27,7 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/registration/gicp.h>
 
 #include <pclomp/ndt_omp.h>
 #include <fast_gicp/ndt/ndt_cuda.hpp>
@@ -64,6 +72,9 @@ public:
     b_acc_cov = declare_parameter<double>("b_acc_cov", 0.0001);
     b_gyr_cov = declare_parameter<double>("b_gyr_cov", 0.0001);
 
+    // NDT rate control (Hz) - default 2Hz
+    ndt_rate = declare_parameter<double>("ndt_rate", 2.0);
+
     // Topic names (configurable via parameters)
     std::string points_topic = declare_parameter<std::string>("points_topic", "/velodyne_points");
     std::string imu_topic = declare_parameter<std::string>("imu_topic", "/gpsimu_driver/imu_data");
@@ -75,7 +86,7 @@ public:
     points_sub = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 5, std::bind(&HdlLocalizationNodelet::points_callback, this, std::placeholders::_1));
     RCLCPP_INFO(get_logger(), "subscribing to points topic: %s", points_topic.c_str());
 
-    auto latch_qos = 10;  // rclcpp::QoS(1).transient_local();
+    auto latch_qos = 10;
     globalmap_sub =
       create_subscription<sensor_msgs::msg::PointCloud2>("/globalmap", latch_qos, std::bind(&HdlLocalizationNodelet::globalmap_callback, this, std::placeholders::_1));
 
@@ -107,7 +118,25 @@ public:
 
       relocalize_server = create_service<std_srvs::srv::Empty>("/relocalize", std::bind(&HdlLocalizationNodelet::relocalize, this, std::placeholders::_1, std::placeholders::_2));
     }
+
+    // Initialize NDT thread control
+    ndt_thread_running = true;
+    ndt_has_new_scan = false;
+
     initialize_params();
+
+    // Start NDT thread (runs at ndt_rate Hz)
+    ndt_thread = std::thread(&HdlLocalizationNodelet::ndt_thread_func, this);
+    RCLCPP_INFO(get_logger(), "NDT thread started at %.1f Hz", ndt_rate);
+  }
+
+  ~HdlLocalizationNodelet() {
+    // Stop NDT thread
+    ndt_thread_running = false;
+    ndt_cv.notify_all();
+    if (ndt_thread.joinable()) {
+      ndt_thread.join();
+    }
   }
 
 private:
@@ -115,8 +144,8 @@ private:
     if (reg_method == "NDT_OMP") {
       RCLCPP_INFO(get_logger(), "NDT_OMP is selected");
       pclomp::NormalDistributionsTransform<PointT, PointT>::Ptr ndt(new pclomp::NormalDistributionsTransform<PointT, PointT>());
-      ndt->setTransformationEpsilon(0.01);   // Convergence threshold
-      ndt->setMaximumIterations(30);         // Balanced iterations for 20Hz input
+      ndt->setTransformationEpsilon(0.01);
+      ndt->setMaximumIterations(30);
       ndt->setResolution(ndt_resolution);
       if (ndt_neighbor_search_method == "DIRECT1") {
         RCLCPP_INFO(get_logger(), "search_method DIRECT1 is selected");
@@ -157,12 +186,22 @@ private:
       } else {
         RCLCPP_WARN(get_logger(), "invalid search method was given");
       }
-      // return ndt;
       std::shared_ptr<pcl::Registration<PointT, PointT>>(ndt.get(), [](pcl::Registration<PointT, PointT>*) {});
     }
 
     RCLCPP_ERROR_STREAM(get_logger(), "unknown registration method:" << reg_method);
     return nullptr;
+  }
+
+  pcl::Registration<PointT, PointT>::Ptr create_gicp() {
+    // Create GICP for frame-to-frame odometry (fast, local alignment)
+    pcl::GeneralizedIterativeClosestPoint<PointT, PointT>::Ptr gicp(
+      new pcl::GeneralizedIterativeClosestPoint<PointT, PointT>());
+    gicp->setMaximumIterations(15);  // Fast iterations for real-time
+    gicp->setTransformationEpsilon(0.01);
+    gicp->setMaxCorrespondenceDistance(1.0);  // Local correspondence
+    gicp->setEuclideanFitnessEpsilon(0.01);
+    return gicp;
   }
 
   void initialize_params() {
@@ -172,8 +211,11 @@ private:
     voxelgrid->setLeafSize(downsample_resolution, downsample_resolution, downsample_resolution);
     downsample_filter = voxelgrid;
 
-    RCLCPP_INFO(get_logger(), "create registration method for localization");
+    RCLCPP_INFO(get_logger(), "create NDT registration for global map alignment");
     registration = create_registration();
+
+    RCLCPP_INFO(get_logger(), "create GICP registration for frame-to-frame odometry");
+    gicp_registration = create_gicp();
 
     // global localization
     RCLCPP_INFO(get_logger(), "create registration method for fallback during relocalization");
@@ -203,12 +245,25 @@ private:
   }
 
 private:
+  // ===========================================
+  // IMU Callback - High frequency prediction
+  // ===========================================
   void imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr imu_msg) {
-    // RCLCPP_INFO(get_logger(), "----------------");
-    // RCLCPP_INFO(get_logger(), "imu_callback");
-    // RCLCPP_INFO(get_logger(), "----------------");
-    std::lock_guard<std::mutex> lock(imu_data_mutex);
-    imu_data.push_back(imu_msg);
+    if (use_imu) {
+      std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      if (pose_estimator) {
+        const auto& acc = imu_msg->linear_acceleration;
+        const auto& gyro = imu_msg->angular_velocity;
+        double acc_sign = invert_acc ? -1.0 : 1.0;
+        double gyro_sign = invert_gyro ? -1.0 : 1.0;
+
+        // Run UKF prediction with IMU data (no odometry publish here)
+        pose_estimator->predict(
+          imu_msg->header.stamp,
+          acc_sign * Eigen::Vector3f(acc.x, acc.y, acc.z),
+          gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
+      }
+    }
   }
 
   // Helper function to remove leading slash from frame_id (TF2 requirement)
@@ -219,11 +274,10 @@ private:
     return frame_id;
   }
 
+  // ===========================================
+  // Points Callback - Frame-to-frame GICP odometry (LiDAR rate)
+  // ===========================================
   void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
-    // RCLCPP_INFO(get_logger(), "");
-    // RCLCPP_INFO(get_logger(), "points_callback");
-    // RCLCPP_INFO(get_logger(), "");
-
     std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
     if (!pose_estimator) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5.0, "waiting for initial pose input!!");
@@ -237,11 +291,9 @@ private:
 
     const auto& stamp = points_msg->header.stamp;
     pcl::PointCloud<PointT>::Ptr pcl_cloud(new pcl::PointCloud<PointT>());
-    // point_msg의 sensor_msg/pointCloud2 type을 pcl_cloud type으로 형변환
-    // sensor_msg/pointCloud2 -> pcl::PointCloud<PointT>
     pcl::fromROSMsg(*points_msg, *pcl_cloud);
 
-    // Sanitize frame_id (remove leading slash for TF2 compatibility)
+    // Sanitize frame_id
     pcl_cloud->header.frame_id = sanitize_frame_id(pcl_cloud->header.frame_id);
 
     if (pcl_cloud->empty()) {
@@ -257,124 +309,161 @@ private:
     }
 
     auto filtered = downsample(cloud);
-    last_scan = filtered;
 
     if (relocalizing) {
       delta_estimater->add_frame(filtered);
     }
 
-    Eigen::Matrix4f before = pose_estimator->matrix();
+    // ===========================================
+    // Frame-to-frame GICP odometry (every LiDAR frame)
+    // ===========================================
+    if (prev_scan && !prev_scan->empty()) {
+      // GICP: align current scan to previous scan
+      gicp_registration->setInputSource(filtered);
+      gicp_registration->setInputTarget(prev_scan);
 
-    // predict
-    if (!use_imu) {
-      pose_estimator->predict(stamp);
-    } else {
-      std::lock_guard<std::mutex> lock(imu_data_mutex);
-      // RCLCPP_INFO(get_logger(),"imu size is : %d ", imu_data.size());
-      auto imu_iter = imu_data.begin();
-      for (imu_iter; imu_iter != imu_data.end(); imu_iter++) {
-        if (rclcpp::Time(stamp) < rclcpp::Time((*imu_iter)->header.stamp)) {
-          break;
+      pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
+
+      // Use identity as initial guess (small motion assumption between frames)
+      Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
+      gicp_registration->align(*aligned, init_guess);
+
+      if (gicp_registration->hasConverged()) {
+        // Get relative transformation (delta motion)
+        Eigen::Matrix4f delta = gicp_registration->getFinalTransformation();
+
+        // Apply GICP odometry to UKF via predict_odom
+        pose_estimator->predict_odom(delta);
+
+        RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000,
+          "GICP: delta_t=(%.3f, %.3f, %.3f), score=%.4f",
+          delta(0,3), delta(1,3), delta(2,3),
+          gicp_registration->getFitnessScore());
+      }
+    }
+
+    // Store current scan for next frame
+    prev_scan = filtered;
+    last_scan = filtered;
+    last_scan_stamp = stamp;
+
+    // ===========================================
+    // Queue scan for NDT thread (low frequency global alignment)
+    // ===========================================
+    {
+      std::lock_guard<std::mutex> lock(ndt_mutex);
+      ndt_scan_queue = filtered;
+      ndt_scan_stamp = stamp;
+      ndt_has_new_scan = true;
+    }
+    ndt_cv.notify_one();
+
+    // Publish odometry at LiDAR rate
+    publish_odometry(stamp, pose_estimator->matrix());
+
+    // Debug output
+    Eigen::Vector3f pos = pose_estimator->pos();
+    Eigen::Vector3f vel = pose_estimator->vel();
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+      "Pose: (%.3f, %.3f, %.3f), vel: (%.3f, %.3f, %.3f)",
+      pos.x(), pos.y(), pos.z(), vel.x(), vel.y(), vel.z());
+  }
+
+  // ===========================================
+  // NDT Thread - Global map alignment (1-2Hz)
+  // ===========================================
+  void ndt_thread_func() {
+    double ndt_period_ms = 1000.0 / ndt_rate;
+    auto last_ndt_time = std::chrono::steady_clock::now();
+
+    while (ndt_thread_running && rclcpp::ok()) {
+      pcl::PointCloud<PointT>::ConstPtr scan;
+      rclcpp::Time scan_stamp;
+
+      // Wait for new scan or timeout
+      {
+        std::unique_lock<std::mutex> lock(ndt_mutex);
+        ndt_cv.wait_for(lock, std::chrono::milliseconds((int)ndt_period_ms),
+          [this]{ return ndt_has_new_scan || !ndt_thread_running; });
+
+        if (!ndt_thread_running) break;
+        if (!ndt_has_new_scan) continue;
+
+        // Rate limiting
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ndt_time).count();
+        if (elapsed < ndt_period_ms * 0.8) {
+          continue;  // Skip if too soon
         }
-        const auto& acc = (*imu_iter)->linear_acceleration;
-        const auto& gyro = (*imu_iter)->angular_velocity;
-        double acc_sign = invert_acc ? -1.0 : 1.0;
-        double gyro_sign = invert_gyro ? -1.0 : 1.0;
-        pose_estimator->predict((*imu_iter)->header.stamp, acc_sign * Eigen::Vector3f(acc.x, acc.y, acc.z), gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
-      }
-      imu_data.erase(imu_data.begin(), imu_iter);
-    }
 
-    // odometry-based prediction
-    rclcpp::Time last_correction_time = pose_estimator->last_correction_time();
-    if (enable_robot_odometry_prediction && last_correction_time != rclcpp::Time((int64_t)0, get_clock()->get_clock_type())) {
-      geometry_msgs::msg::TransformStamped odom_delta;
-      if (tf_buffer->canTransform(odom_child_frame_id, last_correction_time, odom_child_frame_id, stamp, robot_odom_frame_id, rclcpp::Duration(std::chrono::milliseconds(100)))) {
-        odom_delta =
-          tf_buffer->lookupTransform(odom_child_frame_id, last_correction_time, odom_child_frame_id, stamp, robot_odom_frame_id, rclcpp::Duration(std::chrono::milliseconds(0)));
-      } else if (tf_buffer->canTransform(
-                   odom_child_frame_id,
-                   last_correction_time,
-                   odom_child_frame_id,
-                   rclcpp::Time((int64_t)0, get_clock()->get_clock_type()),
-                   robot_odom_frame_id,
-                   rclcpp::Duration(std::chrono::milliseconds(0)))) {
-        odom_delta = tf_buffer->lookupTransform(
-          odom_child_frame_id,
-          last_correction_time,
-          odom_child_frame_id,
-          rclcpp::Time((int64_t)0, get_clock()->get_clock_type()),
-          robot_odom_frame_id,
-          rclcpp::Duration(std::chrono::milliseconds(0)));
+        scan = ndt_scan_queue;
+        scan_stamp = ndt_scan_stamp;
+        ndt_has_new_scan = false;
+        last_ndt_time = now;
       }
 
-      if (odom_delta.header.stamp == rclcpp::Time((int64_t)0, get_clock()->get_clock_type())) {
-        RCLCPP_WARN_STREAM(get_logger(), "failed to look up transform between " << cloud->header.frame_id << " and " << robot_odom_frame_id);
+      if (!scan || scan->empty()) continue;
+      if (!globalmap) continue;
+
+      // ===========================================
+      // Perform NDT alignment to global map
+      // ===========================================
+      std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
+      if (!pose_estimator) continue;
+
+      // Use current UKF estimate as initial guess
+      Eigen::Matrix4f init_guess = pose_estimator->matrix();
+
+      // NDT alignment
+      pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
+      registration->setInputSource(scan);
+      registration->align(*aligned, init_guess);
+
+      if (registration->hasConverged()) {
+        Eigen::Matrix4f ndt_result = registration->getFinalTransformation();
+        Eigen::Vector3f ndt_pos = ndt_result.block<3, 1>(0, 3);
+        Eigen::Quaternionf ndt_quat(ndt_result.block<3, 3>(0, 0));
+
+        // Calculate prediction error
+        Eigen::Vector3f pred_pos = pose_estimator->pos();
+        Eigen::Vector3f pred_error = ndt_pos - pred_pos;
+
+        // Apply NDT correction to UKF (reset drift)
+        // Create observation vector
+        Eigen::VectorXf observation(7);
+        observation.middleRows(0, 3) = ndt_pos;
+        observation.middleRows(3, 4) = Eigen::Vector4f(ndt_quat.w(), ndt_quat.x(), ndt_quat.y(), ndt_quat.z());
+
+        // Directly reset UKF state to NDT result (drift correction)
+        pose_estimator->correct(scan_stamp, scan);
+
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+          "NDT: (%.3f, %.3f, %.3f), score: %.4f, pred_err: (%.3f, %.3f, %.3f)",
+          ndt_pos.x(), ndt_pos.y(), ndt_pos.z(),
+          registration->getFitnessScore(),
+          pred_error.x(), pred_error.y(), pred_error.z());
+
+        // Publish aligned points
+        if (aligned_pub->get_subscription_count()) {
+          aligned->header.frame_id = "map";
+          aligned->header.stamp = scan->header.stamp;
+          sensor_msgs::msg::PointCloud2 aligned_msg;
+          pcl::toROSMsg(*aligned, aligned_msg);
+          aligned_pub->publish(aligned_msg);
+        }
       } else {
-        Eigen::Isometry3d delta = tf2::transformToEigen(odom_delta);
-        pose_estimator->predict_odom(delta.cast<float>().matrix());
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "NDT did not converge!");
       }
     }
-
-    // correct
-    Eigen::Matrix4f before_correct = pose_estimator->matrix();
-    auto aligned = pose_estimator->correct(stamp, filtered);
-    Eigen::Matrix4f after_correct = pose_estimator->matrix();
-
-    // Get raw NDT result
-    Eigen::Matrix4f ndt_result = registration->getFinalTransformation();
-    Eigen::Vector3f ndt_pos = ndt_result.block<3, 1>(0, 3);
-
-    // Debug: print NDT result - every 500ms to track movement
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "NDT: (%.3f, %.3f, %.3f), score: %.4f, converged: %d, pts: %zu",
-      ndt_pos.x(), ndt_pos.y(), ndt_pos.z(),
-      registration->getFitnessScore(), registration->hasConverged(),
-      filtered->size());
-
-    // Debug: Compare UKF prediction (before_correct) vs actual NDT result
-    Eigen::Vector3f ukf_pred_pos = before_correct.block<3, 1>(0, 3);
-    Eigen::Vector3f ukf_vel = pose_estimator->vel();
-    Eigen::Vector3f pred_error = ndt_pos - ukf_pred_pos;
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "UKF pred: (%.3f, %.3f, %.3f), vel: (%.3f, %.3f, %.3f), pred_err: (%.3f, %.3f, %.3f)",
-      ukf_pred_pos.x(), ukf_pred_pos.y(), ukf_pred_pos.z(),
-      ukf_vel.x(), ukf_vel.y(), ukf_vel.z(),
-      pred_error.x(), pred_error.y(), pred_error.z());
-
-
-    if (aligned_pub->get_subscription_count()) {
-      aligned->header.frame_id = "map";
-      aligned->header.stamp = cloud->header.stamp;
-      sensor_msgs::msg::PointCloud2 aligned_msg;
-      pcl::toROSMsg(*aligned, aligned_msg);
-      aligned_pub->publish(aligned_msg);
-    }
-
-    if (status_pub->get_subscription_count()) {
-      publish_scan_matching_status(points_msg->header, aligned);
-    }
-
-    // Use UKF corrected pose for odometry output
-    // UKF combines IMU prediction with NDT correction for smooth trajectory
-    publish_odometry(points_msg->header.stamp, pose_estimator->matrix());
-
-    // RCLCPP_INFO(get_logger(), "");
-    // RCLCPP_INFO(get_logger(), "----------finish points callback------------");
-    // RCLCPP_INFO(get_logger(), "");
   }
 
   /**
    * @brief callback for globalmap input
-   * @param points_msg
    */
   void globalmap_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
-    RCLCPP_INFO(get_logger(), "");
     RCLCPP_INFO(get_logger(), "globalmap received!");
-    RCLCPP_INFO(get_logger(), "");
 
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
-    // pcl::PointCloud<PointT>::Ptr cloud = boost::make_shared<pcl::PointCloud<PointT>>();
     pcl::fromROSMsg(*points_msg, *cloud);
     globalmap = cloud;
 
@@ -385,15 +474,12 @@ private:
       auto req = std::make_shared<hdl_global_localization::srv::SetGlobalMap::Request>();
       pcl::toROSMsg(*globalmap, req->global_map);
       auto result = set_global_map_service->async_send_request(req);
-      if (rclcpp::spin_until_future_complete(rclcpp::Node::SharedPtr(this), result) != rclcpp::FutureReturnCode::SUCCESS) {
-        RCLCPP_ERROR(get_logger(), "Failed to call SetGlobalMap service");
-      }
+      // Note: Not blocking here to avoid deadlock
     }
   }
 
   /**
    * @brief perform global localization to relocalize the sensor position
-   * @param
    */
   bool relocalize(std::shared_ptr<std_srvs::srv::Empty::Request> req, std::shared_ptr<std_srvs::srv::Empty::Response> res) {
     if (last_scan == nullptr) {
@@ -446,7 +532,6 @@ private:
 
   /**
    * @brief callback for initial pose input ("2D Pose Estimate" on rviz)
-   * @param pose_msg
    */
   void initialpose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr pose_msg) {
     RCLCPP_INFO(get_logger(), "initial pose received!!");
@@ -456,6 +541,9 @@ private:
     pose_estimator.reset(
       new hdl_localization::PoseEstimator(registration, get_clock()->now(), Eigen::Vector3f(p.x, p.y, p.z), Eigen::Quaternionf(q.w, q.x, q.y, q.z), cool_time_duration,
         acc_cov, gyr_cov, b_acc_cov, b_gyr_cov));
+
+    // Reset previous scan for GICP
+    prev_scan = nullptr;
   }
 
   pcl::PointCloud<PointT>::ConstPtr downsample(const pcl::PointCloud<PointT>::ConstPtr& cloud) const {
@@ -516,64 +604,12 @@ private:
     odom.header.frame_id = "map";
 
     odom.pose.pose = tf2::toMsg(Eigen::Isometry3d(pose.cast<double>()));
-    // odom.pose.pose.position.x = pose_trans.transform.translation.x;
-    // odom.pose.pose.position.y = pose_trans.transform.translation.y;
-    // odom.pose.pose.position.z = pose_trans.transform.translation.z;
-    // odom.pose.pose.orientation = pose_trans.transform.rotation;
     odom.child_frame_id = odom_child_frame_id;
     odom.twist.twist.linear.x = 0.0;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
 
     pose_pub->publish(odom);
-  }
-
-  void publish_scan_matching_status(const std_msgs::msg::Header& header, pcl::PointCloud<PointT>::ConstPtr aligned) {
-    msg::ScanMatchingStatus status;
-    status.header = header;
-
-    status.has_converged = registration->hasConverged();
-    status.matching_error = registration->getFitnessScore();
-
-    const double max_correspondence_dist = 0.5;
-
-    int num_inliers = 0;
-    std::vector<int> k_indices;
-    std::vector<float> k_sq_dists;
-    for (int i = 0; i < aligned->size(); i++) {
-      const auto& pt = aligned->at(i);
-      registration->getSearchMethodTarget()->nearestKSearch(pt, 1, k_indices, k_sq_dists);
-      if (k_sq_dists[0] < max_correspondence_dist * max_correspondence_dist) {
-        num_inliers++;
-      }
-    }
-    status.inlier_fraction = static_cast<float>(num_inliers) / aligned->size();
-    status.relative_pose = tf2::eigenToTransform(Eigen::Isometry3d(registration->getFinalTransformation().cast<double>())).transform;
-
-    status.prediction_labels.reserve(2);
-    status.prediction_errors.reserve(2);
-
-    std::vector<double> errors(6, 0.0);
-
-    if (pose_estimator->wo_prediction_error()) {
-      status.prediction_labels.push_back(std_msgs::msg::String());
-      status.prediction_labels.back().data = "without_pred";
-      status.prediction_errors.push_back(tf2::eigenToTransform(Eigen::Isometry3d(pose_estimator->wo_prediction_error().get().cast<double>())).transform);
-    }
-
-    if (pose_estimator->imu_prediction_error()) {
-      status.prediction_labels.push_back(std_msgs::msg::String());
-      status.prediction_labels.back().data = use_imu ? "imu" : "motion_model";
-      status.prediction_errors.push_back(tf2::eigenToTransform(Eigen::Isometry3d(pose_estimator->imu_prediction_error().get().cast<double>())).transform);
-    }
-
-    if (pose_estimator->odom_prediction_error()) {
-      status.prediction_labels.push_back(std_msgs::msg::String());
-      status.prediction_labels.back().data = "odom";
-      status.prediction_errors.push_back(tf2::eigenToTransform(Eigen::Isometry3d(pose_estimator->odom_prediction_error().get().cast<double>())).transform);
-    }
-
-    status_pub->publish(status);
   }
 
 private:
@@ -598,18 +634,28 @@ private:
   std::unique_ptr<tf2_ros::Buffer> tf_buffer;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
 
-  // imu input buffer
-  std::mutex imu_data_mutex;
-  std::vector<sensor_msgs::msg::Imu::ConstSharedPtr> imu_data;
-
-  // globalmap and registration method
+  // globalmap and registration methods
   pcl::PointCloud<PointT>::Ptr globalmap;
   pcl::Filter<PointT>::Ptr downsample_filter;
-  pcl::Registration<PointT, PointT>::Ptr registration;
+  pcl::Registration<PointT, PointT>::Ptr registration;       // NDT for global map alignment
+  pcl::Registration<PointT, PointT>::Ptr gicp_registration;  // GICP for frame-to-frame odometry
+
+  // Frame-to-frame scan storage
+  pcl::PointCloud<PointT>::ConstPtr prev_scan;
 
   // pose estimator
   std::mutex pose_estimator_mutex;
   std::unique_ptr<hdl_localization::PoseEstimator> pose_estimator;
+
+  // NDT thread for low-frequency global alignment
+  std::thread ndt_thread;
+  std::atomic<bool> ndt_thread_running;
+  std::mutex ndt_mutex;
+  std::condition_variable ndt_cv;
+  pcl::PointCloud<PointT>::ConstPtr ndt_scan_queue;
+  rclcpp::Time ndt_scan_stamp;
+  std::atomic<bool> ndt_has_new_scan;
+  double ndt_rate;
 
   // global localization
   bool use_global_localization;
@@ -617,6 +663,7 @@ private:
   std::unique_ptr<DeltaEstimater> delta_estimater;
 
   pcl::PointCloud<PointT>::ConstPtr last_scan;
+  rclcpp::Time last_scan_stamp;
   rclcpp::Client<hdl_global_localization::srv::SetGlobalMap>::SharedPtr set_global_map_service;
   rclcpp::Client<hdl_global_localization::srv::QueryGlobalLocalization>::SharedPtr query_global_localization_service;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr relocalize_server;
