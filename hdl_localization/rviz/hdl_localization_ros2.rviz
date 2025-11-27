@@ -1,12 +1,11 @@
 Panels:
   - Class: rviz_common/Displays
-    Help Height: 78
+    Help Height: 138
     Name: Displays
     Property Tree Widget:
-      Expanded:
-        - /Global Options1
+      Expanded: ~
       Splitter Ratio: 0.5
-    Tree Height: 1240
+    Tree Height: 565
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -24,7 +23,7 @@ Panels:
     Experimental: false
     Name: Time
     SyncMode: 0
-    SyncSource: PointCloud2
+    SyncSource: Global Map
 Visualization Manager:
   Class: ""
   Displays:
@@ -64,12 +63,12 @@ Visualization Manager:
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: PointCloud2
+      Name: Global Map
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 1
-      Size (m): 0.009999999776482582
-      Style: Points
+      Size (m): 0.05000000074505806
+      Style: Flat Squares
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -137,7 +136,7 @@ Visualization Manager:
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: PointCloud2
+      Name: NDT Matching Points
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -152,6 +151,62 @@ Visualization Manager:
         Value: /aligned_points
       Use Fixed Frame: true
       Use rainbow: true
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: RGB Image
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /spadi/rgb_image/image_raw/compressed
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Ambient Image
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /spadi/ambient_image
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Depth Image
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /spadi/depth_image
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Intensity Image
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /spadi/intensity_image
       Value: true
   Enabled: true
   Global Options:
@@ -198,34 +253,42 @@ Visualization Manager:
   Value: true
   Views:
     Current:
-      Class: rviz_default_plugins/Orbit
-      Distance: 53.41305923461914
+      Class: rviz_default_plugins/ThirdPersonFollower
+      Distance: 50
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.5531377196311951
-        Y: 1.435699224472046
-        Z: -0.49635303020477295
+        X: 5
+        Y: 0
+        Z: 0
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.0253983736038208
-      Target Frame: spadi/lidar
-      Value: Orbit (rviz_default_plugins)
-      Yaw: -1.5696066617965698
+      Pitch: 0.5950000286102295
+      Target Frame: odom
+      Value: ThirdPersonFollower (rviz_default_plugins)
+      Yaw: 3.140000104904175
     Saved: ~
 Window Geometry:
+  Ambient Image:
+    collapsed: false
+  Depth Image:
+    collapsed: false
   Displays:
     collapsed: false
-  Height: 1531
+  Height: 2086
   Hide Left Dock: false
-  Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000004000000000000015600000561fc0200000008fb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003b00000561000000c700fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261000000010000010f00000561fc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000a00560069006500770073010000003b00000561000000a000fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000009be0000003efc0100000002fb0000000800540069006d00650100000000000009be0000025300fffffffb0000000800540069006d006501000000000000045000000000000000000000074d0000056100000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Hide Right Dock: true
+  Intensity Image:
+    collapsed: false
+  QMainWindow State: 000000ff00000000fd0000000400000000000003570000055dfc020000000afb0000001200530065006c0065006300740069006f006e00000001e10000009b000000b000fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c00610079007301000002350000032d0000018200fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261fb0000000c00430061006d00650072006100000006a3000000ef0000000000000000fb0000001200520047004200200049006d006100670065010000056e000002240000004a00ffffff00000001000001ed0000055dfc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000a0056006900650077007300000002350000055d0000013200fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000f00000001bbfc0100000004fb0000001a0041006d006200690065006e007400200049006d0061006700650100000000000005070000010900fffffffb000000160044006500700074006800200049006d006100670065010000051300000506000000ea00fffffffb0000001e0049006e00740065006e007300690074007900200049006d0061006700650100000a25000004db0000010b00fffffffb0000000a00560069006500770073030000004e00000080000002e1000001970000000300000f000000005afc0100000002fb0000000800540069006d0065010000000000000f000000058100fffffffb0000000800540069006d0065010000000000000450000000000000000000000b9d0000055d00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  RGB Image:
+    collapsed: false
   Selection:
     collapsed: false
   Time:
@@ -233,7 +296,7 @@ Window Geometry:
   Tool Properties:
     collapsed: false
   Views:
-    collapsed: false
-  Width: 2494
-  X: 66
-  Y: 32
+    collapsed: true
+  Width: 3840
+  X: 3840
+  Y: 0

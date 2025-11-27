@@ -107,37 +107,65 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
 
 /**
  * @brief update the state of the odomety-based pose estimation
+ * @param odom_delta  relative transformation from GICP (frame-to-frame)
+ *
+ * This function applies the GICP delta directly to the main UKF state,
+ * so that odometry reflects frame-to-frame motion at LiDAR rate.
  */
 void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
+  // Get current pose from UKF
+  Eigen::Vector3f current_pos(ukf->mean[0], ukf->mean[1], ukf->mean[2]);
+  Eigen::Quaternionf current_quat(ukf->mean[6], ukf->mean[7], ukf->mean[8], ukf->mean[9]);
+  current_quat.normalize();
+
+  // Extract delta translation and rotation from GICP result
+  Eigen::Vector3f delta_trans = odom_delta.block<3, 1>(0, 3);
+  Eigen::Quaternionf delta_quat(odom_delta.block<3, 3>(0, 0));
+  delta_quat.normalize();
+
+  // Apply delta in world frame: new_pos = current_pos + R_current * delta_trans
+  Eigen::Vector3f new_pos = current_pos + current_quat.toRotationMatrix() * delta_trans;
+
+  // Apply delta rotation: new_quat = current_quat * delta_quat
+  Eigen::Quaternionf new_quat = current_quat * delta_quat;
+  new_quat.normalize();
+
+  // Ensure quaternion consistency (avoid sign flips)
+  if(new_quat.coeffs().dot(current_quat.coeffs()) < 0.0f) {
+    new_quat.coeffs() *= -1.0f;
+  }
+
+  // Update main UKF state directly
+  ukf->mean[0] = new_pos[0];
+  ukf->mean[1] = new_pos[1];
+  ukf->mean[2] = new_pos[2];
+  ukf->mean[6] = new_quat.w();
+  ukf->mean[7] = new_quat.x();
+  ukf->mean[8] = new_quat.y();
+  ukf->mean[9] = new_quat.z();
+
+  // Also update odom_ukf for fusion purposes
   if(!odom_ukf) {
     Eigen::MatrixXf odom_process_noise = Eigen::MatrixXf::Identity(7, 7);
     Eigen::MatrixXf odom_measurement_noise = Eigen::MatrixXf::Identity(7, 7) * 1e-3;
 
     Eigen::VectorXf odom_mean(7);
-    odom_mean.block<3, 1>(0, 0) = Eigen::Vector3f(ukf->mean[0], ukf->mean[1], ukf->mean[2]);
-    odom_mean.block<4, 1>(3, 0) = Eigen::Vector4f(ukf->mean[6], ukf->mean[7], ukf->mean[8], ukf->mean[9]);
+    odom_mean.block<3, 1>(0, 0) = new_pos;
+    odom_mean.block<4, 1>(3, 0) = Eigen::Vector4f(new_quat.w(), new_quat.x(), new_quat.y(), new_quat.z());
     Eigen::MatrixXf odom_cov = Eigen::MatrixXf::Identity(7, 7) * 1e-2;
 
     OdomSystem odom_system;
     odom_ukf.reset(new kkl::alg::UnscentedKalmanFilterX<float, OdomSystem>(odom_system, 7, 7, 7, odom_process_noise, odom_measurement_noise, odom_mean, odom_cov));
+  } else {
+    // Update odom_ukf state as well
+    odom_ukf->mean[0] = new_pos[0];
+    odom_ukf->mean[1] = new_pos[1];
+    odom_ukf->mean[2] = new_pos[2];
+    odom_ukf->mean[3] = new_quat.w();
+    odom_ukf->mean[4] = new_quat.x();
+    odom_ukf->mean[5] = new_quat.y();
+    odom_ukf->mean[6] = new_quat.z();
   }
-
-  // invert quaternion if the rotation axis is flipped
-  Eigen::Quaternionf quat(odom_delta.block<3, 3>(0, 0));
-  if(odom_quat().coeffs().dot(quat.coeffs()) < 0.0) {
-    quat.coeffs() *= -1.0f;
-  }
-
-  Eigen::VectorXf control(7);
-  control.middleRows(0, 3) = odom_delta.block<3, 1>(0, 3);
-  control.middleRows(3, 4) = Eigen::Vector4f(quat.w(), quat.x(), quat.y(), quat.z());
-
-  Eigen::MatrixXf process_noise = Eigen::MatrixXf::Identity(7, 7);
-  process_noise.topLeftCorner(3, 3) = Eigen::Matrix3f::Identity() * odom_delta.block<3, 1>(0, 3).norm() + Eigen::Matrix3f::Identity() * 1e-3;
-  process_noise.bottomRightCorner(4, 4) = Eigen::Matrix4f::Identity() * (1 - std::abs(quat.w())) + Eigen::Matrix4f::Identity() * 1e-3;
-
-  odom_ukf->setProcessNoiseCov(process_noise);
-  odom_ukf->predict(control);
 }
 
 /**

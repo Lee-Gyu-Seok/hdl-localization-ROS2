@@ -227,15 +227,22 @@ private:
     if (specify_init_pose) {
       RCLCPP_INFO(get_logger(), "initialize pose estimator with specified parameters!!");
       RCLCPP_INFO(get_logger(), "IMU covariance - acc: %.4f, gyr: %.4f, b_acc: %.6f, b_gyr: %.6f", acc_cov, gyr_cov, b_acc_cov, b_gyr_cov);
+
+      Eigen::Vector3f init_pos(
+        declare_parameter<double>("init_pos_x", 0.0),
+        declare_parameter<double>("init_pos_y", 0.0),
+        declare_parameter<double>("init_pos_z", 0.0));
+      Eigen::Quaternionf init_quat(
+        declare_parameter<double>("init_ori_w", 1.0),
+        declare_parameter<double>("init_ori_x", 0.0),
+        declare_parameter<double>("init_ori_y", 0.0),
+        declare_parameter<double>("init_ori_z", 0.0));
+
       pose_estimator.reset(new hdl_localization::PoseEstimator(
         registration,
         get_clock()->now(),
-        Eigen::Vector3f(declare_parameter<double>("init_pos_x", 0.0), declare_parameter<double>("init_pos_y", 0.0), declare_parameter<double>("init_pos_z", 0.0)),
-        Eigen::Quaternionf(
-          declare_parameter<double>("init_ori_w", 1.0),
-          declare_parameter<double>("init_ori_x", 0.0),
-          declare_parameter<double>("init_ori_y", 0.0),
-          declare_parameter<double>("init_ori_z", 0.0)),
+        init_pos,
+        init_quat,
         cool_time_duration,
         acc_cov,
         gyr_cov,
@@ -246,18 +253,18 @@ private:
 
 private:
   // ===========================================
-  // IMU Callback - High frequency prediction
+  // IMU Callback - UKF prediction only (no odom publish here)
   // ===========================================
   void imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr imu_msg) {
     if (use_imu) {
       std::lock_guard<std::mutex> lock(pose_estimator_mutex);
-      if (pose_estimator) {
+      if (pose_estimator && globalmap) {
         const auto& acc = imu_msg->linear_acceleration;
         const auto& gyro = imu_msg->angular_velocity;
         double acc_sign = invert_acc ? -1.0 : 1.0;
         double gyro_sign = invert_gyro ? -1.0 : 1.0;
 
-        // Run UKF prediction with IMU data (no odometry publish here)
+        // Run UKF prediction with IMU data (orientation update)
         pose_estimator->predict(
           imu_msg->header.stamp,
           acc_sign * Eigen::Vector3f(acc.x, acc.y, acc.z),
@@ -315,7 +322,8 @@ private:
     }
 
     // ===========================================
-    // Frame-to-frame GICP odometry (every LiDAR frame)
+    // Frame-to-frame GICP odometry (LiDAR rate ~20Hz)
+    // Compute delta motion and feed to UKF via predict_odom
     // ===========================================
     if (prev_scan && !prev_scan->empty()) {
       // GICP: align current scan to previous scan
@@ -323,29 +331,32 @@ private:
       gicp_registration->setInputTarget(prev_scan);
 
       pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
-
-      // Use identity as initial guess (small motion assumption between frames)
       Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
       gicp_registration->align(*aligned, init_guess);
 
       if (gicp_registration->hasConverged()) {
-        // Get relative transformation (delta motion)
+        // Get relative transformation (delta motion from prev to current)
         Eigen::Matrix4f delta = gicp_registration->getFinalTransformation();
 
-        // Apply GICP odometry to UKF via predict_odom
+        // Feed GICP delta to UKF - this updates UKF state with odometry measurement
         pose_estimator->predict_odom(delta);
 
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000,
-          "GICP: delta_t=(%.3f, %.3f, %.3f), score=%.4f",
+          "GICP delta: (%.4f, %.4f, %.4f), score: %.4f",
           delta(0,3), delta(1,3), delta(2,3),
           gicp_registration->getFitnessScore());
       }
     }
 
-    // Store current scan for next frame
+    // Store current scan for next GICP
     prev_scan = filtered;
     last_scan = filtered;
     last_scan_stamp = stamp;
+
+    // ===========================================
+    // Publish odometry at LiDAR rate (~20Hz)
+    // ===========================================
+    publish_odometry(stamp, pose_estimator->matrix());
 
     // ===========================================
     // Queue scan for NDT thread (low frequency global alignment)
@@ -358,15 +369,11 @@ private:
     }
     ndt_cv.notify_one();
 
-    // Publish odometry at LiDAR rate
-    publish_odometry(stamp, pose_estimator->matrix());
-
     // Debug output
     Eigen::Vector3f pos = pose_estimator->pos();
-    Eigen::Vector3f vel = pose_estimator->vel();
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "Pose: (%.3f, %.3f, %.3f), vel: (%.3f, %.3f, %.3f)",
-      pos.x(), pos.y(), pos.z(), vel.x(), vel.y(), vel.z());
+      "GICP pose: (%.3f, %.3f, %.3f)",
+      pos.x(), pos.y(), pos.z());
   }
 
   // ===========================================
