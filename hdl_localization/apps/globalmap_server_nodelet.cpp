@@ -25,8 +25,8 @@ public:
   : Node("map_server", options) {
     initialize_params();
 
-    // publish globalmap with "latched" publisher
-    auto latch_qos = 10;  // rclcpp::QoS(1).transient_local();
+    // publish globalmap with "latched" publisher (transient_local for late subscribers)
+    auto latch_qos = rclcpp::QoS(1).transient_local().reliable();
     globalmap_pub = create_publisher<sensor_msgs::msg::PointCloud2>("/globalmap", latch_qos);
     globalmap_pub_timer = create_wall_timer(std::chrono::milliseconds(5000), std::bind(&GlobalmapServerNodelet::pub_once_cb, this));
 
