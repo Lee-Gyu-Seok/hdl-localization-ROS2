@@ -325,7 +325,10 @@ private:
     // Frame-to-frame GICP odometry (LiDAR rate ~20Hz)
     // Compute delta motion and feed to UKF via predict_odom
     // ===========================================
-    if (prev_scan && !prev_scan->empty()) {
+    Eigen::Vector3f linear_vel = Eigen::Vector3f::Zero();
+    Eigen::Vector3f angular_vel = Eigen::Vector3f::Zero();
+
+    if (prev_scan && !prev_scan->empty() && prev_scan_stamp.nanoseconds() > 0) {
       // GICP: align current scan to previous scan
       gicp_registration->setInputSource(filtered);
       gicp_registration->setInputTarget(prev_scan);
@@ -337,6 +340,22 @@ private:
       if (gicp_registration->hasConverged()) {
         // Get relative transformation (delta motion from prev to current)
         Eigen::Matrix4f delta = gicp_registration->getFinalTransformation();
+
+        // Calculate dt for velocity computation
+        rclcpp::Time curr_stamp(stamp);
+        double dt = (curr_stamp - prev_scan_stamp).seconds();
+        if (dt > 0.001 && dt < 1.0) {
+          // Extract translation delta and compute linear velocity in world frame
+          Eigen::Vector3f delta_trans = delta.block<3, 1>(0, 3);
+          Eigen::Quaternionf current_quat = pose_estimator->quat();
+          Eigen::Vector3f world_delta = current_quat.toRotationMatrix() * delta_trans;
+          linear_vel = world_delta / dt;
+
+          // Extract rotation and compute angular velocity
+          Eigen::Matrix3f delta_rot = delta.block<3, 3>(0, 0);
+          Eigen::AngleAxisf angle_axis(delta_rot);
+          angular_vel = (angle_axis.axis() * angle_axis.angle()) / dt;
+        }
 
         // Feed GICP delta to UKF - this updates UKF state with odometry measurement
         pose_estimator->predict_odom(delta);
@@ -350,13 +369,14 @@ private:
 
     // Store current scan for next GICP
     prev_scan = filtered;
+    prev_scan_stamp = stamp;
     last_scan = filtered;
     last_scan_stamp = stamp;
 
     // ===========================================
     // Publish odometry at LiDAR rate (~20Hz)
     // ===========================================
-    publish_odometry(stamp, pose_estimator->matrix());
+    publish_odometry(stamp, pose_estimator->matrix(), linear_vel, angular_vel);
 
     // ===========================================
     // Queue scan for NDT thread (low frequency global alignment)
@@ -566,7 +586,7 @@ private:
     return filtered;
   }
 
-  void publish_odometry(const rclcpp::Time& stamp, const Eigen::Matrix4f& pose) {
+  void publish_odometry(const rclcpp::Time& stamp, const Eigen::Matrix4f& pose, const Eigen::Vector3f& linear_vel, const Eigen::Vector3f& angular_vel) {
     // broadcast the transform over tf
     if (send_tf_transforms) {
       if (tf_buffer->canTransform(robot_odom_frame_id, odom_child_frame_id, rclcpp::Time((int64_t)0, get_clock()->get_clock_type()))) {
@@ -612,9 +632,12 @@ private:
 
     odom.pose.pose = tf2::toMsg(Eigen::Isometry3d(pose.cast<double>()));
     odom.child_frame_id = odom_child_frame_id;
-    odom.twist.twist.linear.x = 0.0;
-    odom.twist.twist.linear.y = 0.0;
-    odom.twist.twist.angular.z = 0.0;
+    odom.twist.twist.linear.x = linear_vel.x();
+    odom.twist.twist.linear.y = linear_vel.y();
+    odom.twist.twist.linear.z = linear_vel.z();
+    odom.twist.twist.angular.x = angular_vel.x();
+    odom.twist.twist.angular.y = angular_vel.y();
+    odom.twist.twist.angular.z = angular_vel.z();
 
     pose_pub->publish(odom);
   }
@@ -649,6 +672,7 @@ private:
 
   // Frame-to-frame scan storage
   pcl::PointCloud<PointT>::ConstPtr prev_scan;
+  rclcpp::Time prev_scan_stamp;
 
   // pose estimator
   std::mutex pose_estimator_mutex;

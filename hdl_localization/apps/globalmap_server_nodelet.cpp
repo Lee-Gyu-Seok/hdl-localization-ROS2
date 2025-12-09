@@ -7,6 +7,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/PCLPointCloud2.h>
 
 ////***************************start pyc modified***************************/
 #include <std_msgs/msg/string.hpp>
@@ -19,6 +21,7 @@ namespace hdl_localization {
 class GlobalmapServerNodelet : public rclcpp::Node {
 public:
   using PointT = pcl::PointXYZ;
+  using PointRGB = pcl::PointXYZRGB;
 
   GlobalmapServerNodelet(const rclcpp::NodeOptions& options)
   // GlobalmapServerNodelet 생성자. 기본적으로 map_server 라는 이름을 갖는 인스턴스를 만듦
@@ -37,28 +40,103 @@ public:
   }
 
 private:
+  // Helper function to check if PCD has RGB field
+  bool hasRgbField(const std::string& pcd_path) {
+    pcl::PCLPointCloud2 cloud2;
+    if (pcl::io::loadPCDFile(pcd_path, cloud2) < 0) {
+      return false;
+    }
+    for (const auto& field : cloud2.fields) {
+      if (field.name == "rgb" || field.name == "rgba") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Load PCD and convert to PointCloud2 message (auto-detect point type)
+  void loadPcdToMsg(const std::string& pcd_path, double downsample_resolution) {
+    bool has_rgb = hasRgbField(pcd_path);
+    RCLCPP_INFO(get_logger(), "PCD point type: %s", has_rgb ? "PointXYZRGB" : "PointXYZ");
+
+    if (has_rgb) {
+      // Load as PointXYZRGB
+      pcl::PointCloud<PointRGB>::Ptr cloud_rgb(new pcl::PointCloud<PointRGB>());
+      pcl::io::loadPCDFile(pcd_path, *cloud_rgb);
+      cloud_rgb->header.frame_id = "map";
+
+      // Apply UTM offset if available
+      bool convert_utm_to_local = declare_parameter<bool>("convert_utm_to_local", true);
+      std::ifstream utm_file(pcd_path + ".utm");
+      if (utm_file.is_open() && convert_utm_to_local) {
+        double utm_easting, utm_northing, altitude;
+        utm_file >> utm_easting >> utm_northing >> altitude;
+        for (auto& pt : cloud_rgb->points) {
+          pt.getVector3fMap() -= Eigen::Vector3f(utm_easting, utm_northing, altitude);
+        }
+        RCLCPP_INFO_STREAM(get_logger(),
+          "Global map offset by UTM reference coordinates (x = " << utm_easting << ", y = " << utm_northing << ") and altitude (z = " << altitude << ")");
+      }
+
+      // Downsample
+      boost::shared_ptr<pcl::VoxelGrid<PointRGB>> voxelgrid(new pcl::VoxelGrid<PointRGB>());
+      voxelgrid->setLeafSize(downsample_resolution, downsample_resolution, downsample_resolution);
+      voxelgrid->setInputCloud(cloud_rgb);
+      pcl::PointCloud<PointRGB>::Ptr filtered_rgb(new pcl::PointCloud<PointRGB>());
+      voxelgrid->filter(*filtered_rgb);
+
+      // Convert to ROS message
+      globalmap_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
+      pcl::toROSMsg(*filtered_rgb, *globalmap_msg);
+      globalmap_msg->header.frame_id = "map";
+
+      // Also store as PointXYZ for internal use
+      globalmap.reset(new pcl::PointCloud<PointT>());
+      pcl::copyPointCloud(*filtered_rgb, *globalmap);
+
+      RCLCPP_INFO(get_logger(), "Loaded PointXYZRGB map with %zu points", filtered_rgb->size());
+    } else {
+      // Load as PointXYZ
+      globalmap.reset(new pcl::PointCloud<PointT>());
+      pcl::io::loadPCDFile(pcd_path, *globalmap);
+      globalmap->header.frame_id = "map";
+
+      // Apply UTM offset if available
+      bool convert_utm_to_local = declare_parameter<bool>("convert_utm_to_local", true);
+      std::ifstream utm_file(pcd_path + ".utm");
+      if (utm_file.is_open() && convert_utm_to_local) {
+        double utm_easting, utm_northing, altitude;
+        utm_file >> utm_easting >> utm_northing >> altitude;
+        for (auto& pt : globalmap->points) {
+          pt.getVector3fMap() -= Eigen::Vector3f(utm_easting, utm_northing, altitude);
+        }
+        RCLCPP_INFO_STREAM(get_logger(),
+          "Global map offset by UTM reference coordinates (x = " << utm_easting << ", y = " << utm_northing << ") and altitude (z = " << altitude << ")");
+      }
+
+      // Downsample
+      boost::shared_ptr<pcl::VoxelGrid<PointT>> voxelgrid(new pcl::VoxelGrid<PointT>());
+      voxelgrid->setLeafSize(downsample_resolution, downsample_resolution, downsample_resolution);
+      voxelgrid->setInputCloud(globalmap);
+      pcl::PointCloud<PointT>::Ptr filtered(new pcl::PointCloud<PointT>());
+      voxelgrid->filter(*filtered);
+      globalmap = filtered;
+
+      // Convert to ROS message
+      globalmap_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
+      pcl::toROSMsg(*globalmap, *globalmap_msg);
+      globalmap_msg->header.frame_id = "map";
+
+      RCLCPP_INFO(get_logger(), "Loaded PointXYZ map with %zu points", globalmap->size());
+    }
+  }
+
   ////***************************start pyc modified***************************/
   void map_update_callback(const std_msgs::msg::String::SharedPtr msg) {
     cout << "in map update callback" << endl;
-    RCLCPP_INFO(get_logger(), "Received map request, map path : ");
-    std::string globalmap_pcd = msg->data;
-    globalmap.reset(new pcl::PointCloud<PointT>());
-    pcl::io::loadPCDFile(globalmap_pcd, *globalmap);
-    globalmap->header.frame_id = "map";
-
-    // downsample globalmap
+    RCLCPP_INFO(get_logger(), "Received map request, map path : %s", msg->data.c_str());
     double downsample_resolution = declare_parameter<double>("downsample_resolution", 0.1);
-    boost::shared_ptr<pcl::VoxelGrid<PointT>> voxelgrid(new pcl::VoxelGrid<PointT>());
-    voxelgrid->setLeafSize(downsample_resolution, downsample_resolution, downsample_resolution);
-    voxelgrid->setInputCloud(globalmap);
-
-    pcl::PointCloud<PointT>::Ptr filtered(new pcl::PointCloud<PointT>());
-    voxelgrid->filter(*filtered);
-
-    globalmap = filtered;
-    // sensor_msgs::msg::PointCloud2 globalmap_msg;
-    // pcl::toROSMsg(*globalmap, globalmap_msg);
-    // globalmap_pub->publish(globalmap_msg);
+    loadPcdToMsg(msg->data, downsample_resolution);
   }
   /***************************end pyc modified***************************/  ///
 
@@ -74,48 +152,18 @@ private:
     cout << endl << globalmap_pcd << endl << endl;
     /***************************end pyc modified***************************/  ///
 
-    globalmap.reset(new pcl::PointCloud<PointT>());
-    pcl::io::loadPCDFile(globalmap_pcd, *globalmap);
-    globalmap->header.frame_id = "map";
-
-    ////***************************start pyc modified***************************/
-    // cout << endl << *globalmap << endl << endl;
-    /***************************end pyc modified***************************/  ///
-
-    bool convert_utm_to_local = declare_parameter<bool>("convert_utm_to_local", true);
-    std::ifstream utm_file(globalmap_pcd + ".utm");
-    if (utm_file.is_open() && convert_utm_to_local) {
-      double utm_easting;
-      double utm_northing;
-      double altitude;
-      utm_file >> utm_easting >> utm_northing >> altitude;
-      for (auto& pt : globalmap->points) {
-        pt.getVector3fMap() -= Eigen::Vector3f(utm_easting, utm_northing, altitude);
-      }
-      RCLCPP_INFO_STREAM(
-        get_logger(),
-        "Global map offset by UTM reference coordinates (x = " << utm_easting << ", y = " << utm_northing << ") and altitude (z = " << altitude << ")");
-    }
-
     // downsample globalmap
     double downsample_resolution = declare_parameter<double>("downsample_resolution", 0.1);
-    boost::shared_ptr<pcl::VoxelGrid<PointT>> voxelgrid(new pcl::VoxelGrid<PointT>());
-    voxelgrid->setLeafSize(downsample_resolution, downsample_resolution, downsample_resolution);
-    voxelgrid->setInputCloud(globalmap);
-
-    pcl::PointCloud<PointT>::Ptr filtered(new pcl::PointCloud<PointT>());
-    voxelgrid->filter(*filtered);
-
-    globalmap = filtered;
+    loadPcdToMsg(globalmap_pcd, downsample_resolution);
   }
 
   void pub_once_cb() {
-    // sensor_msgs::msg::PointCloud2 globalmap_msg;
-    globalmap_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
-    pcl::toROSMsg(*globalmap, *globalmap_msg);
-
-    globalmap_pub->publish(*globalmap_msg);
-    globalmap_pub_timer.reset();  // Stop timer after first publish
+    // globalmap_msg is already created by loadPcdToMsg with correct point type
+    // Publish once and stop timer (latched QoS will keep message for late subscribers)
+    if (globalmap_msg) {
+      globalmap_pub->publish(*globalmap_msg);
+      globalmap_pub_timer.reset();  // Stop timer after first publish
+    }
   }
 
 private:
