@@ -73,15 +73,17 @@ def generate_launch_description():
         ],
     )
 
-    # Static TF: map -> odom (identity, since no odometry source)
-    map_odom_tf = Node(
-        name="map_odom_tf",
+    # Static TF: odom -> spadi/lidar (identity transform)
+    # This allows RViz to visualize spadi/pointcloud in map frame
+    # TF chain: map -> odom (published by hdl_localization) -> spadi/lidar (static identity)
+    odom_lidar_tf = Node(
+        name="odom_lidar_tf",
         package="tf2_ros",
         executable="static_transform_publisher",
         arguments=[
             "0", "0", "0",
             "0", "0", "0", "1",
-            "map", "odom"
+            "odom", "spadi/lidar"
         ],
     )
 
@@ -168,7 +170,7 @@ def generate_launch_description():
             globalmap_pcd,
             launch_ros.actions.SetParameter(name="use_sim_time", value=use_sim_time),
             lidar_imu_tf,
-            map_odom_tf,
+            odom_lidar_tf,
             container,
             rviz_node,
         ]

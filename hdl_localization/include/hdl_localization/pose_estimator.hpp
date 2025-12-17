@@ -70,8 +70,21 @@ public:
 
   /**
    * @brief update the state of the odomety-based pose estimation
+   * @deprecated Use correct_gicp() for proper tightly-coupled fusion
    */
   void predict_odom(const Eigen::Matrix4f& odom_delta);
+
+  /**
+   * @brief Correct UKF state with GICP measurement (Tightly-coupled fusion)
+   * @param gicp_pose  Absolute pose from GICP alignment
+   * @param fitness    GICP fitness score (lower = better match)
+   *
+   * Standard tightly-coupled IMU-LiDAR sensor fusion:
+   * - IMU predicts state at high rate (100Hz) via predict()
+   * - GICP provides measurement at LiDAR rate (20Hz)
+   * - UKF optimally fuses IMU prediction and GICP measurement via Kalman gain
+   */
+  void correct_gicp(const Eigen::Matrix4f& gicp_pose, double fitness = 0.1);
 
   /**
    * @brief correct

@@ -25,13 +25,31 @@ public:
 
   GlobalmapServerNodelet(const rclcpp::NodeOptions& options)
   // GlobalmapServerNodelet 생성자. 기본적으로 map_server 라는 이름을 갖는 인스턴스를 만듦
-  : Node("map_server", options) {
+  : Node("map_server", options), last_subscriber_count_(0) {
     initialize_params();
 
-    // publish globalmap with "latched" publisher (transient_local for late subscribers)
+    // Latched QoS for globalmap (transient_local keeps last message for late subscribers)
     auto latch_qos = rclcpp::QoS(1).transient_local().reliable();
     globalmap_pub = create_publisher<sensor_msgs::msg::PointCloud2>("/globalmap", latch_qos);
-    globalmap_pub_timer = create_wall_timer(std::chrono::milliseconds(5000), std::bind(&GlobalmapServerNodelet::pub_once_cb, this));
+
+    // Timer to monitor subscriber count and republish when new subscriber joins
+    // This handles RViz checkbox toggle (off->on creates new subscription)
+    globalmap_pub_timer = create_wall_timer(
+      std::chrono::milliseconds(500),
+      [this]() {
+        if (!globalmap_msg) return;
+
+        size_t current_count = globalmap_pub->get_subscription_count();
+
+        // Publish when new subscriber detected or on first run
+        if (current_count > last_subscriber_count_ || (current_count > 0 && !initial_published_)) {
+          globalmap_pub->publish(*globalmap_msg);
+          initial_published_ = true;
+          RCLCPP_INFO(get_logger(), "Globalmap published (subscribers: %zu)", current_count);
+        }
+
+        last_subscriber_count_ = current_count;
+      });
 
     ////***************************start pyc modified***************************/
     map_update_sub =
@@ -157,15 +175,6 @@ private:
     loadPcdToMsg(globalmap_pcd, downsample_resolution);
   }
 
-  void pub_once_cb() {
-    // globalmap_msg is already created by loadPcdToMsg with correct point type
-    // Publish once and stop timer (latched QoS will keep message for late subscribers)
-    if (globalmap_msg) {
-      globalmap_pub->publish(*globalmap_msg);
-      globalmap_pub_timer.reset();  // Stop timer after first publish
-    }
-  }
-
 private:
   // ROS
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr globalmap_pub;
@@ -178,6 +187,10 @@ private:
   ////***************************start pyc modified***************************/
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr map_update_sub;
   /***************************end pyc modified***************************/  ///
+
+  // Subscriber monitoring for auto-republish
+  size_t last_subscriber_count_;
+  bool initial_published_ = false;
 };
 
 }  // namespace hdl_localization

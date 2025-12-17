@@ -49,7 +49,10 @@ public:
     return next_state;
   }
 
-  // system equation
+  // system equation (with IMU input)
+  // IMU-LiDAR fusion: IMU predicts orientation only, LiDAR (GICP) handles position
+  // This avoids accelerometer integration drift while utilizing gyroscope for orientation
+  // Position/velocity are updated by GICP measurements through UKF correction step
   VectorXt f(const VectorXt& state, const VectorXt& control) const {
     VectorXt next_state(16);
 
@@ -58,31 +61,28 @@ public:
     Quaterniont qt(state[6], state[7], state[8], state[9]);
     qt.normalize();
 
-    Vector3t acc_bias = state.middleRows(10, 3);
     Vector3t gyro_bias = state.middleRows(13, 3);
-
-    Vector3t raw_acc = control.middleRows(0, 3);
     Vector3t raw_gyro = control.middleRows(3, 3);
 
-    // position
-    next_state.middleRows(0, 3) = pt + vt * dt;  //
-
-    // velocity
-    Vector3t g(0.0f, 0.0f, 9.80665f);
-    Vector3t acc_ = raw_acc - acc_bias;
-    Vector3t acc = qt * acc_;
-    next_state.middleRows(3, 3) = vt + (acc - g) * dt;
-    // next_state.middleRows(3, 3) = vt; // + (acc - g) * dt;		// acceleration didn't contribute to accuracy due to large noise
-
-    // orientation
+    // Compensate gyro bias
     Vector3t gyro = raw_gyro - gyro_bias;
+
+    // Position: predict using current velocity (no accelerometer integration)
+    // This provides smooth interpolation between GICP corrections
+    next_state.middleRows(0, 3) = pt + vt * dt;
+
+    // Velocity: keep constant (updated by GICP correction)
+    next_state.middleRows(3, 3) = vt;
+
+    // Orientation: update with gyroscope (this is stable and useful)
     Quaterniont dq(1, gyro[0] * dt / 2, gyro[1] * dt / 2, gyro[2] * dt / 2);
     dq.normalize();
     Quaterniont qt_ = (qt * dq).normalized();
     next_state.middleRows(6, 4) << qt_.w(), qt_.x(), qt_.y(), qt_.z();
 
-    next_state.middleRows(10, 3) = state.middleRows(10, 3);  // constant bias on acceleration
-    next_state.middleRows(13, 3) = state.middleRows(13, 3);  // constant bias on angular velocity
+    // Bias: modeled as random walk (constant + noise)
+    next_state.middleRows(10, 3) = state.middleRows(10, 3);
+    next_state.middleRows(13, 3) = state.middleRows(13, 3);
 
     return next_state;
   }

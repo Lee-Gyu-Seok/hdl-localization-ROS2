@@ -106,66 +106,90 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
 }
 
 /**
- * @brief update the state of the odomety-based pose estimation
- * @param odom_delta  relative transformation from GICP (frame-to-frame)
+ * @brief Correct UKF state with GICP measurement (Tightly-coupled fusion)
+ * @param gicp_pose  Absolute pose from GICP alignment
+ * @param fitness    GICP fitness score (lower = better match)
  *
- * This function applies the GICP delta directly to the main UKF state,
- * so that odometry reflects frame-to-frame motion at LiDAR rate.
+ * Standard tightly-coupled IMU-LiDAR sensor fusion:
+ * - IMU predicts state at high rate (100Hz) via ukf->predict()
+ * - GICP provides measurement at LiDAR rate (20Hz)
+ * - UKF optimally fuses IMU prediction and GICP measurement via Kalman gain
+ * - Kalman gain weights based on prediction uncertainty vs measurement noise
+ *
+ * Benefits over loosely-coupled (previous implementation):
+ * - IMU prediction is not discarded, but optimally weighted
+ * - High IMU rate provides smooth inter-LiDAR pose estimates
+ * - GICP corrects IMU drift through proper Kalman update
+ * - Covariance properly propagated for uncertainty estimation
  */
-void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
-  // Get current pose from UKF
-  Eigen::Vector3f current_pos(ukf->mean[0], ukf->mean[1], ukf->mean[2]);
+void PoseEstimator::correct_gicp(const Eigen::Matrix4f& gicp_pose, double fitness) {
+  // Extract position and orientation from GICP result
+  Eigen::Vector3f gicp_pos = gicp_pose.block<3, 1>(0, 3);
+  Eigen::Quaternionf gicp_quat(gicp_pose.block<3, 3>(0, 0));
+  gicp_quat.normalize();
+
+  // Get current UKF quaternion for sign consistency
   Eigen::Quaternionf current_quat(ukf->mean[6], ukf->mean[7], ukf->mean[8], ukf->mean[9]);
-  current_quat.normalize();
-
-  // Extract delta translation and rotation from GICP result
-  Eigen::Vector3f delta_trans = odom_delta.block<3, 1>(0, 3);
-  Eigen::Quaternionf delta_quat(odom_delta.block<3, 3>(0, 0));
-  delta_quat.normalize();
-
-  // Apply delta in world frame: new_pos = current_pos + R_current * delta_trans
-  Eigen::Vector3f new_pos = current_pos + current_quat.toRotationMatrix() * delta_trans;
-
-  // Apply delta rotation: new_quat = current_quat * delta_quat
-  Eigen::Quaternionf new_quat = current_quat * delta_quat;
-  new_quat.normalize();
-
-  // Ensure quaternion consistency (avoid sign flips)
-  if(new_quat.coeffs().dot(current_quat.coeffs()) < 0.0f) {
-    new_quat.coeffs() *= -1.0f;
+  if(gicp_quat.coeffs().dot(current_quat.coeffs()) < 0.0f) {
+    gicp_quat.coeffs() *= -1.0f;
   }
 
-  // Update main UKF state directly
-  ukf->mean[0] = new_pos[0];
-  ukf->mean[1] = new_pos[1];
-  ukf->mean[2] = new_pos[2];
-  ukf->mean[6] = new_quat.w();
-  ukf->mean[7] = new_quat.x();
-  ukf->mean[8] = new_quat.y();
-  ukf->mean[9] = new_quat.z();
+  // Build observation vector [pos(3), quat(4)]
+  Eigen::VectorXf observation(7);
+  observation.middleRows(0, 3) = gicp_pos;
+  observation.middleRows(3, 4) = Eigen::Vector4f(gicp_quat.w(), gicp_quat.x(), gicp_quat.y(), gicp_quat.z());
 
-  // Also update odom_ukf for fusion purposes
+  // Adaptive measurement noise based on GICP fitness score
+  // Lower fitness = better match = lower noise = trust GICP more
+  // fitness typically ranges from 0.01 (good) to 1.0+ (poor)
+  double base_pos_noise = 0.01;   // Base position noise (m²)
+  double base_rot_noise = 0.001;  // Base rotation noise (rad²)
+  double noise_scale = std::max(1.0, fitness * 10.0);  // Scale by fitness
+
+  Eigen::MatrixXf adaptive_measurement_noise = Eigen::MatrixXf::Identity(7, 7);
+  adaptive_measurement_noise.block<3, 3>(0, 0) *= base_pos_noise * noise_scale;
+  adaptive_measurement_noise.block<4, 4>(3, 3) *= base_rot_noise * noise_scale;
+
+  // Store original measurement noise and apply adaptive noise
+  Eigen::MatrixXf original_noise = ukf->getMeasurementNoiseCov();
+  ukf->setMeasurementNoiseCov(adaptive_measurement_noise);
+
+  // UKF correction step - this computes Kalman gain and optimally fuses
+  // IMU prediction with GICP measurement
+  ukf->correct(observation);
+
+  // Restore original measurement noise for NDT corrections
+  ukf->setMeasurementNoiseCov(original_noise);
+
+  // Update odom_ukf for compatibility
   if(!odom_ukf) {
     Eigen::MatrixXf odom_process_noise = Eigen::MatrixXf::Identity(7, 7);
     Eigen::MatrixXf odom_measurement_noise = Eigen::MatrixXf::Identity(7, 7) * 1e-3;
 
     Eigen::VectorXf odom_mean(7);
-    odom_mean.block<3, 1>(0, 0) = new_pos;
-    odom_mean.block<4, 1>(3, 0) = Eigen::Vector4f(new_quat.w(), new_quat.x(), new_quat.y(), new_quat.z());
+    odom_mean.block<3, 1>(0, 0) = pos();
+    Eigen::Quaternionf q = quat();
+    odom_mean.block<4, 1>(3, 0) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
     Eigen::MatrixXf odom_cov = Eigen::MatrixXf::Identity(7, 7) * 1e-2;
 
     OdomSystem odom_system;
     odom_ukf.reset(new kkl::alg::UnscentedKalmanFilterX<float, OdomSystem>(odom_system, 7, 7, 7, odom_process_noise, odom_measurement_noise, odom_mean, odom_cov));
   } else {
-    // Update odom_ukf state as well
-    odom_ukf->mean[0] = new_pos[0];
-    odom_ukf->mean[1] = new_pos[1];
-    odom_ukf->mean[2] = new_pos[2];
-    odom_ukf->mean[3] = new_quat.w();
-    odom_ukf->mean[4] = new_quat.x();
-    odom_ukf->mean[5] = new_quat.y();
-    odom_ukf->mean[6] = new_quat.z();
+    odom_ukf->correct(observation);
   }
+}
+
+/**
+ * @brief Legacy function for backward compatibility
+ * @deprecated Use correct_gicp() instead for proper sensor fusion
+ */
+void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
+  // Convert delta to absolute pose
+  Eigen::Matrix4f current_pose = matrix();
+  Eigen::Matrix4f gicp_pose = current_pose * odom_delta;
+
+  // Use proper UKF correction with default fitness
+  correct_gicp(gicp_pose, 0.1);
 }
 
 /**
@@ -246,12 +270,8 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
 
   ukf->correct(observation);
 
-  // CRITICAL: Directly set UKF position/orientation state to NDT result
-  // The UKF correction step alone isn't enough because:
-  // 1. Velocity is not observable from NDT, causing drift
-  // 2. Process noise makes the filter trust prediction too much
-  // By forcing position/orientation to match NDT, we ensure the estimate follows NDT closely
-  // while still benefiting from IMU-based prediction between NDT corrections
+  // Directly set UKF position/orientation state to NDT result
+  // This ensures the estimate follows NDT closely for drift correction
   ukf->mean[0] = p[0];
   ukf->mean[1] = p[1];
   ukf->mean[2] = p[2];
@@ -261,14 +281,11 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   ukf->mean[9] = q.z();
 
   // Update velocity estimate using NDT position difference
-  // This gives the UKF a reasonable velocity for the next prediction step
   if(prev_correction_stamp.nanoseconds() > 0) {
     double dt = (stamp - prev_correction_stamp).seconds();
     if(dt > 0.01 && dt < 1.0) {  // Valid time range (10ms ~ 1s)
       Eigen::Vector3f prev_pos = no_guess.block<3, 1>(0, 3);
       Eigen::Vector3f ndt_velocity = (p - prev_pos) / dt;
-
-      // Set velocity from NDT position difference
       ukf->mean[3] = ndt_velocity[0];
       ukf->mean[4] = ndt_velocity[1];
       ukf->mean[5] = ndt_velocity[2];

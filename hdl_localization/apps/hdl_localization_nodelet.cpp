@@ -1,6 +1,6 @@
 // hdl localizaton ROS2 - Multi-rate sensor fusion architecture
 // IMU (100-400Hz) -> UKF prediction
-// LiDAR GICP (10-20Hz) -> frame-to-frame odometry -> UKF correction
+// LiDAR Fast GICP (10-20Hz) -> frame-to-frame odometry -> UKF correction
 // NDT (1-2Hz) -> global map alignment -> UKF correction (drift reset)
 
 #include <mutex>
@@ -28,9 +28,14 @@
 
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/registration/gicp.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/common/common.h>
 
 #include <pclomp/ndt_omp.h>
 #include <fast_gicp/ndt/ndt_cuda.hpp>
+#include <fast_gicp/gicp/fast_gicp.hpp>
+
+// Fast GICP for frame-to-frame odometry (already included above)
 
 #include <hdl_localization/pose_estimator.hpp>
 #include <hdl_localization/delta_estimater.hpp>
@@ -59,7 +64,7 @@ public:
     reg_method = declare_parameter<std::string>("reg_method", "NDT_OMP");
     ndt_neighbor_search_method = declare_parameter<std::string>("ndt_neighbor_search_method", "DIRECT7");
     ndt_neighbor_search_radius = declare_parameter<double>("ndt_neighbor_search_radius", 2.0);
-    ndt_resolution = declare_parameter<double>("ndt_resolution", 1.0);
+    ndt_resolution = declare_parameter<double>("ndt_resolution", 0.5);
     enable_robot_odometry_prediction = declare_parameter<bool>("enable_robot_odometry_prediction", false);
 
     use_imu = declare_parameter<bool>("use_imu", true);
@@ -72,8 +77,14 @@ public:
     b_acc_cov = declare_parameter<double>("b_acc_cov", 0.0001);
     b_gyr_cov = declare_parameter<double>("b_gyr_cov", 0.0001);
 
-    // NDT rate control (Hz) - default 2Hz
-    ndt_rate = declare_parameter<double>("ndt_rate", 2.0);
+    // NDT rate control (Hz) - default 0.2Hz (every 5 seconds)
+    ndt_rate = declare_parameter<double>("ndt_rate", 0.2);
+
+    // Local map parameters for efficient NDT matching
+    use_local_map = declare_parameter<bool>("use_local_map", true);
+    local_map_radius = declare_parameter<double>("local_map_radius", 50.0);
+    RCLCPP_INFO(get_logger(), "Local map: %s, radius: %.1fm",
+      use_local_map ? "enabled" : "disabled", local_map_radius);
 
     // Topic names (configurable via parameters)
     std::string points_topic = declare_parameter<std::string>("points_topic", "/velodyne_points");
@@ -193,15 +204,24 @@ private:
     return nullptr;
   }
 
-  pcl::Registration<PointT, PointT>::Ptr create_gicp() {
-    // Create GICP for frame-to-frame odometry (fast, local alignment)
-    pcl::GeneralizedIterativeClosestPoint<PointT, PointT>::Ptr gicp(
-      new pcl::GeneralizedIterativeClosestPoint<PointT, PointT>());
-    gicp->setMaximumIterations(15);  // Fast iterations for real-time
-    gicp->setTransformationEpsilon(0.01);
-    gicp->setMaxCorrespondenceDistance(1.0);  // Local correspondence
-    gicp->setEuclideanFitnessEpsilon(0.01);
-    return gicp;
+  void initialize_frame_to_frame_gicp() {
+    // Fast GICP parameters for frame-to-frame odometry
+    // For consecutive scans at 20Hz, displacement is small (~5cm at 1m/s)
+    // So correspondence distance should be small
+    int gicp_num_threads = declare_parameter<int>("gicp_num_threads", 4);
+    int gicp_max_iterations = declare_parameter<int>("gicp_max_iterations", 32);
+    double gicp_correspondence_distance = declare_parameter<double>("gicp_correspondence_distance", 0.5);
+
+    // Initialize Fast GICP
+    auto gicp = pcl::make_shared<fast_gicp::FastGICP<PointT, PointT>>();
+    gicp->setNumThreads(gicp_num_threads);
+    gicp->setMaximumIterations(gicp_max_iterations);
+    gicp->setMaxCorrespondenceDistance(gicp_correspondence_distance);
+    gicp->setTransformationEpsilon(1e-4);  // Looser epsilon for faster convergence
+    frame_to_frame_gicp = gicp;
+
+    RCLCPP_INFO(get_logger(), "Fast GICP params - threads: %d, max_iter: %d, corr_dist: %.2f",
+      gicp_num_threads, gicp_max_iterations, gicp_correspondence_distance);
   }
 
   void initialize_params() {
@@ -214,8 +234,8 @@ private:
     RCLCPP_INFO(get_logger(), "create NDT registration for global map alignment");
     registration = create_registration();
 
-    RCLCPP_INFO(get_logger(), "create GICP registration for frame-to-frame odometry");
-    gicp_registration = create_gicp();
+    RCLCPP_INFO(get_logger(), "create Fast GICP registration for frame-to-frame odometry");
+    initialize_frame_to_frame_gicp();
 
     // global localization
     RCLCPP_INFO(get_logger(), "create registration method for fallback during relocalization");
@@ -254,6 +274,7 @@ private:
 private:
   // ===========================================
   // IMU Callback - UKF prediction only (no odom publish here)
+  // Also accumulate gyro delta for GICP initial guess
   // ===========================================
   void imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr imu_msg) {
     if (use_imu) {
@@ -264,11 +285,30 @@ private:
         double acc_sign = invert_acc ? -1.0 : 1.0;
         double gyro_sign = invert_gyro ? -1.0 : 1.0;
 
+        Eigen::Vector3f gyro_vec = gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z);
+
         // Run UKF prediction with IMU data (orientation update)
         pose_estimator->predict(
           imu_msg->header.stamp,
           acc_sign * Eigen::Vector3f(acc.x, acc.y, acc.z),
-          gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
+          gyro_vec);
+
+        // Accumulate gyro for GICP initial guess
+        // This helps GICP converge correctly when the robot is rotating
+        {
+          std::lock_guard<std::mutex> gyro_lock(gyro_delta_mutex);
+          double dt = 0.01;  // Approximate IMU rate
+          if (last_imu_stamp.nanoseconds() > 0) {
+            dt = (rclcpp::Time(imu_msg->header.stamp) - last_imu_stamp).seconds();
+            if (dt > 0.0 && dt < 0.1) {
+              // Integrate gyro to get delta rotation
+              Eigen::AngleAxisf delta_rot(gyro_vec.norm() * dt, gyro_vec.normalized());
+              accumulated_gyro_delta = accumulated_gyro_delta * Eigen::Quaternionf(delta_rot);
+              accumulated_gyro_delta.normalize();
+            }
+          }
+          last_imu_stamp = imu_msg->header.stamp;
+        }
       }
     }
   }
@@ -282,7 +322,7 @@ private:
   }
 
   // ===========================================
-  // Points Callback - Frame-to-frame GICP odometry (LiDAR rate)
+  // Points Callback - Frame-to-frame Fast GICP odometry (LiDAR rate)
   // ===========================================
   void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
     std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
@@ -322,52 +362,90 @@ private:
     }
 
     // ===========================================
-    // Frame-to-frame GICP odometry (LiDAR rate ~20Hz)
+    // Frame-to-frame Fast GICP odometry (LiDAR rate ~20Hz)
     // Compute delta motion and feed to UKF via predict_odom
     // ===========================================
     Eigen::Vector3f linear_vel = Eigen::Vector3f::Zero();
     Eigen::Vector3f angular_vel = Eigen::Vector3f::Zero();
 
-    if (prev_scan && !prev_scan->empty() && prev_scan_stamp.nanoseconds() > 0) {
-      // GICP: align current scan to previous scan
-      gicp_registration->setInputSource(filtered);
-      gicp_registration->setInputTarget(prev_scan);
+    // Calculate dt for prediction
+    rclcpp::Time curr_stamp(stamp);
+    double dt = 0.05;
+    if (prev_scan_stamp.nanoseconds() > 0) {
+      dt = (curr_stamp - prev_scan_stamp).seconds();
+      if (dt < 0.001 || dt > 1.0) dt = 0.05;  // Default to 20Hz
+    }
+
+    // Frame-to-frame ICP using Fast GICP
+    if (prev_scan && prev_scan->size() > 100 && filtered->size() > 100) {
+      // Build initial guess from gyro
+      Eigen::Quaternionf gyro_delta_copy;
+      {
+        std::lock_guard<std::mutex> gyro_lock(gyro_delta_mutex);
+        gyro_delta_copy = accumulated_gyro_delta;
+        accumulated_gyro_delta = Eigen::Quaternionf::Identity();
+      }
+
+      Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+      initial_guess.block<3, 3>(0, 0) = gyro_delta_copy.toRotationMatrix();
+
+      // Set up Fast GICP for frame-to-frame matching
+      frame_to_frame_gicp->setInputSource(filtered);
+      frame_to_frame_gicp->setInputTarget(prev_scan);
+
+      // Measure ICP computation time
+      auto icp_start = std::chrono::high_resolution_clock::now();
 
       pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
-      Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
-      gicp_registration->align(*aligned, init_guess);
+      frame_to_frame_gicp->align(*aligned, initial_guess);
 
-      if (gicp_registration->hasConverged()) {
-        // Get relative transformation (delta motion from prev to current)
-        Eigen::Matrix4f delta = gicp_registration->getFinalTransformation();
+      auto icp_end = std::chrono::high_resolution_clock::now();
+      double icp_time_ms = std::chrono::duration<double, std::milli>(icp_end - icp_start).count();
 
-        // Calculate dt for velocity computation
-        rclcpp::Time curr_stamp(stamp);
-        double dt = (curr_stamp - prev_scan_stamp).seconds();
-        if (dt > 0.001 && dt < 1.0) {
-          // Extract translation delta and compute linear velocity in world frame
-          Eigen::Vector3f delta_trans = delta.block<3, 1>(0, 3);
+      if (frame_to_frame_gicp->hasConverged()) {
+        Eigen::Matrix4f delta = frame_to_frame_gicp->getFinalTransformation();
+        Eigen::Vector3f delta_trans = delta.block<3, 1>(0, 3);
+        Eigen::Matrix3f delta_rot = delta.block<3, 3>(0, 0);
+        double trans_norm = delta_trans.norm();
+
+        // Sanity check: reject unreasonably large deltas
+        double max_delta = 1.0;  // 1 meter max per frame
+        double fitness = frame_to_frame_gicp->getFitnessScore();
+
+        if (trans_norm < max_delta && delta_trans.allFinite()) {
+          // Compute world-frame velocity for odom message
           Eigen::Quaternionf current_quat = pose_estimator->quat();
           Eigen::Vector3f world_delta = current_quat.toRotationMatrix() * delta_trans;
-          linear_vel = world_delta / dt;
+          if (dt > 0.001 && dt < 1.0) {
+            linear_vel = world_delta / dt;
 
-          // Extract rotation and compute angular velocity
-          Eigen::Matrix3f delta_rot = delta.block<3, 3>(0, 0);
-          Eigen::AngleAxisf angle_axis(delta_rot);
-          angular_vel = (angle_axis.axis() * angle_axis.angle()) / dt;
+            // Extract rotation and compute angular velocity
+            Eigen::AngleAxisf angle_axis(delta_rot);
+            angular_vel = (angle_axis.axis() * angle_axis.angle()) / dt;
+          }
+
+          // Tightly-coupled fusion: GICP measurement corrects IMU-predicted state
+          // Convert frame-to-frame delta to absolute pose
+          Eigen::Matrix4f gicp_pose = pose_estimator->matrix() * delta;
+
+          // UKF correction with GICP measurement
+          // Kalman gain optimally weights IMU prediction vs GICP measurement
+          pose_estimator->correct_gicp(gicp_pose, fitness);
+
+          RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 200,
+            "GICP-UKF: delta=(%.4f, %.4f, %.4f), fitness=%.4f, src=%zu, tgt=%zu",
+            delta_trans.x(), delta_trans.y(), delta_trans.z(), fitness,
+            filtered->size(), prev_scan->size());
+        } else {
+          RCLCPP_WARN(get_logger(), "Fast-GICP: %.2fms, REJECTED (large delta: %.4f)",
+            icp_time_ms, trans_norm);
         }
-
-        // Feed GICP delta to UKF - this updates UKF state with odometry measurement
-        pose_estimator->predict_odom(delta);
-
-        RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000,
-          "GICP delta: (%.4f, %.4f, %.4f), score: %.4f",
-          delta(0,3), delta(1,3), delta(2,3),
-          gicp_registration->getFitnessScore());
+      } else {
+        RCLCPP_WARN(get_logger(), "Fast-GICP: %.2fms, NOT CONVERGED", icp_time_ms);
       }
     }
 
-    // Store current scan for next GICP
+    // Store current scan for next iteration and NDT
     prev_scan = filtered;
     prev_scan_stamp = stamp;
     last_scan = filtered;
@@ -389,11 +467,6 @@ private:
     }
     ndt_cv.notify_one();
 
-    // Debug output
-    Eigen::Vector3f pos = pose_estimator->pos();
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "GICP pose: (%.3f, %.3f, %.3f)",
-      pos.x(), pos.y(), pos.z());
   }
 
   // ===========================================
@@ -431,6 +504,7 @@ private:
 
       if (!scan || scan->empty()) continue;
       if (!globalmap) continue;
+      if (!registration) continue;
 
       // ===========================================
       // Perform NDT alignment to global map
@@ -438,13 +512,31 @@ private:
       std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
       if (!pose_estimator) continue;
 
+      try {
+
       // Use current UKF estimate as initial guess
       Eigen::Matrix4f init_guess = pose_estimator->matrix();
+      Eigen::Vector3f current_pos = pose_estimator->pos();
+
+      // Extract local map around current position for efficient NDT matching
+      size_t local_map_size = 0;
+      if (use_local_map && globalmap_kdtree) {
+        pcl::PointCloud<PointT>::Ptr local_map = extractLocalMap(current_pos, local_map_radius);
+        if (local_map && local_map->size() > 100) {  // Minimum points threshold
+          registration->setInputTarget(local_map);
+          local_map_size = local_map->size();
+        }
+      }
 
       // NDT alignment
       pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
       registration->setInputSource(scan);
+
+      // Measure NDT computation time
+      auto ndt_start = std::chrono::high_resolution_clock::now();
       registration->align(*aligned, init_guess);
+      auto ndt_end = std::chrono::high_resolution_clock::now();
+      double ndt_time_ms = std::chrono::duration<double, std::milli>(ndt_end - ndt_start).count();
 
       if (registration->hasConverged()) {
         Eigen::Matrix4f ndt_result = registration->getFinalTransformation();
@@ -464,11 +556,12 @@ private:
         // Directly reset UKF state to NDT result (drift correction)
         pose_estimator->correct(scan_stamp, scan);
 
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-          "NDT: (%.3f, %.3f, %.3f), score: %.4f, pred_err: (%.3f, %.3f, %.3f)",
-          ndt_pos.x(), ndt_pos.y(), ndt_pos.z(),
+        RCLCPP_INFO(get_logger(),
+          "NDT: %.2fms, pos: (%.3f, %.3f, %.3f), score: %.4f, pred_err: (%.3f, %.3f, %.3f), scan: %zu, localmap: %zu",
+          ndt_time_ms, ndt_pos.x(), ndt_pos.y(), ndt_pos.z(),
           registration->getFitnessScore(),
-          pred_error.x(), pred_error.y(), pred_error.z());
+          pred_error.x(), pred_error.y(), pred_error.z(),
+          scan->size(), local_map_size);
 
         // Publish aligned points
         if (aligned_pub->get_subscription_count()) {
@@ -479,7 +572,13 @@ private:
           aligned_pub->publish(aligned_msg);
         }
       } else {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "NDT did not converge!");
+        RCLCPP_WARN(get_logger(), "NDT: %.2fms, NOT CONVERGED", ndt_time_ms);
+      }
+
+      } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "NDT thread exception: %s", e.what());
+      } catch (...) {
+        RCLCPP_ERROR(get_logger(), "NDT thread unknown exception");
       }
     }
   }
@@ -494,6 +593,18 @@ private:
     pcl::fromROSMsg(*points_msg, *cloud);
     globalmap = cloud;
 
+    // Calculate bounding box of global map
+    PointT min_pt, max_pt;
+    pcl::getMinMax3D(*globalmap, min_pt, max_pt);
+    RCLCPP_INFO(get_logger(), "globalmap bbox: min(%.2f, %.2f, %.2f) max(%.2f, %.2f, %.2f)",
+      min_pt.x, min_pt.y, min_pt.z, max_pt.x, max_pt.y, max_pt.z);
+
+    // Build KD-Tree for local map extraction
+    globalmap_kdtree.reset(new pcl::KdTreeFLANN<PointT>());
+    globalmap_kdtree->setInputCloud(globalmap);
+    RCLCPP_INFO(get_logger(), "globalmap KD-Tree built with %zu points", globalmap->size());
+
+    // Set full globalmap as initial target (will be replaced by local map during operation)
     registration->setInputTarget(globalmap);
 
     if (use_global_localization) {
@@ -503,6 +614,54 @@ private:
       auto result = set_global_map_service->async_send_request(req);
       // Note: Not blocking here to avoid deadlock
     }
+  }
+
+  /**
+   * @brief Extract local map around current position for efficient NDT matching
+   * @param center  Current position (center of local map)
+   * @param radius  Radius of local map extraction
+   * @return Local map point cloud (downsampled to match scan density)
+   */
+  pcl::PointCloud<PointT>::Ptr extractLocalMap(const Eigen::Vector3f& center, double radius) {
+    if (!globalmap || !globalmap_kdtree) {
+      return nullptr;
+    }
+
+    pcl::PointCloud<PointT>::Ptr local_map(new pcl::PointCloud<PointT>());
+
+    // Use radius search to extract nearby points
+    PointT search_point;
+    search_point.x = center.x();
+    search_point.y = center.y();
+    search_point.z = center.z();
+
+    std::vector<int> indices;
+    std::vector<float> distances;
+
+    if (globalmap_kdtree->radiusSearch(search_point, radius, indices, distances) > 0) {
+      local_map->reserve(indices.size());
+      for (int idx : indices) {
+        local_map->push_back(globalmap->points[idx]);
+      }
+    }
+
+    // Downsample local map to match scan density for better NDT matching
+    // Using larger voxel size (0.25m) to reduce point density and improve score
+    if (local_map->size() > 10000) {
+      pcl::VoxelGrid<PointT> local_voxel;
+      local_voxel.setLeafSize(0.25f, 0.25f, 0.25f);
+      local_voxel.setInputCloud(local_map);
+      pcl::PointCloud<PointT>::Ptr filtered_local(new pcl::PointCloud<PointT>());
+      local_voxel.filter(*filtered_local);
+      local_map = filtered_local;
+    }
+
+    local_map->header = globalmap->header;
+    local_map->width = local_map->size();
+    local_map->height = 1;
+    local_map->is_dense = true;
+
+    return local_map;
   }
 
   /**
@@ -666,13 +825,23 @@ private:
 
   // globalmap and registration methods
   pcl::PointCloud<PointT>::Ptr globalmap;
+  pcl::KdTreeFLANN<PointT>::Ptr globalmap_kdtree;  // KD-Tree for local map extraction
+  bool use_local_map;
+  double local_map_radius;
   pcl::Filter<PointT>::Ptr downsample_filter;
   pcl::Registration<PointT, PointT>::Ptr registration;       // NDT for global map alignment
-  pcl::Registration<PointT, PointT>::Ptr gicp_registration;  // GICP for frame-to-frame odometry
+
+  // Fast GICP for frame-to-frame odometry
+  pcl::Registration<PointT, PointT>::Ptr frame_to_frame_gicp;
 
   // Frame-to-frame scan storage
   pcl::PointCloud<PointT>::ConstPtr prev_scan;
   rclcpp::Time prev_scan_stamp;
+
+  // IMU gyro accumulation for Fast GICP initial guess
+  std::mutex gyro_delta_mutex;
+  Eigen::Quaternionf accumulated_gyro_delta = Eigen::Quaternionf::Identity();
+  rclcpp::Time last_imu_stamp;
 
   // pose estimator
   std::mutex pose_estimator_mutex;
