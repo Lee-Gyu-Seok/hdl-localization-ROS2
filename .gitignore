@@ -3,3 +3,6 @@ __pycache__/
 build/
 install/
 log/
+
+# HDL Localization Log files
+hdl_localization/Log/

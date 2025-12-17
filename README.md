@@ -1,159 +1,198 @@
-# hdl-localization-ROS2
+# HDL Localization ROS2
 
-ROS2 wrapper for hdl-localization package with docker
+ROS2 기반 3D LiDAR 위치 추정 패키지 (NDT + Fast GICP 센서 퓨전)
 
-## 1. Build docker image with Dockerfile  
+## 개요
 
-Before you start hdl-localization with docker, you should install [docker](https://www.docker.com/) and [nvidia-docker](https://github.com/NVIDIA/nvidia-docker) in your PC.  
+이 패키지는 IMU와 LiDAR를 융합한 멀티레이트 센서 퓨전 아키텍처를 제공합니다:
+- **IMU (100-400Hz)**: UKF 예측
+- **Fast GICP (10-20Hz)**: 프레임-투-프레임 오도메트리 → UKF 보정
+- **NDT (1-2Hz)**: 글로벌 맵 정합 → 드리프트 보정
 
-You could also make docker image directly with provieded Dockerfile.  
+## 빌드 방법
 
-Move the terminal path to `/docker` and execute the following command.  
+### 의존성 설치
 
-```
-cd docker
-```
-```
-docker build -t hdl-localization-ros2:latest .
-```
-
-`hdl-localization-ros2:latest` is just example of this docker image, you can replace it with the image name you want.  
-
-After the image is created, you can execute `docker images` command to view the following results from the terminal.  
-
-**output** :  
-
-```
-REPOSITORY                  TAG                    IMAGE ID          CREATED             SIZE
-hdl-localization-ros2       latest                    812ae31625b3   48 minutes ago    3.36GB
+```bash
+# ROS2 Humble 기준
+sudo apt install ros-humble-pcl-ros ros-humble-tf2-eigen ros-humble-tf2-geometry-msgs
 ```
 
-## 2. Make HDL-Localization-ROS2 docker container  
+### 빌드
 
-When you create a docker container, you need several options to use the GUI and share folders.  
-
-First, you should enter the command below in the local terminal to enable docker to communicate with Xserver on the host.  
-
-```
-xhost +local:docker
-```
-
-After that, make your own container with the command below.  
-
-```
-nvidia-docker run --privileged -it \
-           -e NVIDIA_DRIVER_CAPABILITIES=all \
-           -e NVIDIA_VISIBLE_DEVICES=all \
-           --volume=${hdl_localization_repo_root}:/root/workspace/src \
-           --volume=/tmp/.X11-unix:/tmp/.X11-unix:rw \
-           --net=host \
-           --ipc=host \
-           --name=${docker container name} \
-           --env="DISPLAY=$DISPLAY" \
-           ${docker image} /bin/bash
-```   
-
-⚠️ **You should change {hdl_localization_repo_root}, {docker container name}, {docker image} to suit your environment.**  
-
-For example,  
-```
-nvidia-docker run --privileged -it \
-           -e NVIDIA_DRIVER_CAPABILITIES=all \
-           -e NVIDIA_VISIBLE_DEVICES=all \
-           --volume=/home/taeyoung/Desktop/hdl-localization-ROS2:/root/workspace/src \
-           --volume=/tmp/.X11-unix:/tmp/.X11-unix:rw \
-           --net=host \
-           --ipc=host \
-           --name=hdl-localization-ros2 \
-           --env="DISPLAY=$DISPLAY" \
-           --env="QT_X11_NO_MITSHM=1" \
-           hdl-localization-ros2:latest /bin/bash
-```
-
-If you have successfully created the docker container, the terminal output will be similar to the below.  
-
-**output** :  
-
-```
-================HDL localization ROS2 Docker Env Ready================
-root@taeyoung-cilab:/root/workspace#
-```  
-
-## 3. Make custom HDL-Localization-ROS2 launch file
-
-When we created our docker container, we utilized the `--volume` option, so the files we modified locally are directly available inside docker.  
-
-**All you need is `.pcd` file, lidar topic and imu topic!**  
-
-See `hdl_localization_turtlebot.launch.py` and run the example bagfile to get a better understanding.  
-
-```
-points_topic = LaunchConfiguration('points_topic', default='/velodyne_points')         # velodyne topic name
-odom_child_frame_id = LaunchConfiguration('odom_child_frame_id', default='base_link')  # velodyne_points frame ID
-imu_topic = LaunchConfiguration('imu_topic', default='/imu')                           # optional, you should know noise parameter
-globalmap_pcd = DeclareLaunchArgument('globalmap_pcd', default_value='/root/workspace/src/hdl_localization/data/turtlebot3.pcd', description='Path to the global map PCD file')
-
-```
-
-### Build and Run it!
-
-Within Docker, we need 3 containers.  
-To access the same container, use the command below
-```
-docker exec -it hdl-localization-ros2 /bin/bash
-```  
-Within the connected container,
-```
-source /opt/ros/foxy/setup.bash
-```
-
-
-
-```
-root@taeyoung-cilab:~/workspace# 
-```
-
-All should stay on the above path.
-
-- **1st container** (For hdl localization package) 
-```
-colcon build
-``` 
-```
+```bash
+cd ~/colcon_ws
+colcon build --packages-select hdl_localization hdl_global_localization fast_gicp ndt_omp
 source install/setup.bash
 ```
-```
-ros2 launch hdl_localization hdl_localization_turtlebot.launch.py
-```
 
-- **2nd container** (For rviz) 
-```
-rviz2 -d src/hdl_localization/rviz/hdl_localization_ros2.rviz 
+Release 모드로 빌드 (성능 최적화):
+```bash
+colcon build --packages-select hdl_localization --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
 
-- **3rd container** (For sample bagfile)
+## 실행 방법
+
+### 기본 실행
+
+```bash
+ros2 launch hdl_localization hdl_localization_spadi.launch.py \
+  globalmap_pcd:=/path/to/your/map.pcd
 ```
-ros2 bag play src/hdl_localization/sample-bag/subset/
+
+### Rosbag과 함께 실행
+
+```bash
+# 터미널 1: HDL Localization 실행
+ros2 launch hdl_localization hdl_localization_spadi.launch.py \
+  globalmap_pcd:=/path/to/map.pcd
+
+# 터미널 2: Rosbag 재생
+ros2 bag play /path/to/rosbag --clock
 ```
 
+## 설정 파라미터
 
+### 토픽 설정
 
-## TODO
+| 파라미터 | 기본값 | 설명 |
+|---------|-------|------|
+| `points_topic` | `/spadi/pointcloud` | LiDAR 포인트클라우드 토픽 |
+| `imu_topic` | `/spadi/imu` | IMU 토픽 |
+| `odom_child_frame_id` | `spadi/lidar` | 오도메트리 child frame ID |
 
-- [ ] Support hdl_global_localization ROS2 launch file 
-- [ ] Code refactoring  
-- [ ] Support ROS2 humble  
-- [ ] Suuport NDT CUDA
+### IMU 설정
 
+| 파라미터 | 기본값 | 설명 |
+|---------|-------|------|
+| `use_imu` | `true` | IMU 사용 여부 |
+| `invert_acc` | `false` | 가속도계 부호 반전 |
+| `invert_gyro` | `false` | 자이로스코프 부호 반전 |
+| `acc_cov` | `0.5` | 가속도계 노이즈 공분산 |
+| `gyr_cov` | `0.3` | 자이로스코프 노이즈 공분산 |
+| `b_acc_cov` | `0.0001` | 가속도계 바이어스 공분산 |
+| `b_gyr_cov` | `0.0001` | 자이로스코프 바이어스 공분산 |
+
+### NDT 설정
+
+| 파라미터 | 기본값 | 설명 |
+|---------|-------|------|
+| `reg_method` | `NDT_OMP` | 등록 방법 (`NDT_OMP`, `NDT_CUDA_P2D`, `NDT_CUDA_D2D`) |
+| `ndt_resolution` | `1.0` | NDT 해상도 (m) |
+| `ndt_rate` | `1.0` | NDT 실행 주파수 (Hz) |
+| `ndt_neighbor_search_method` | `DIRECT7` | 이웃 탐색 방법 (`DIRECT1`, `DIRECT7`, `KDTREE`) |
+| `ndt_neighbor_search_radius` | `2.0` | 이웃 탐색 반경 (m) |
+
+### Fast GICP 설정
+
+| 파라미터 | 기본값 | 설명 |
+|---------|-------|------|
+| `gicp_correspondence_distance` | `0.3` | 대응점 거리 임계값 (m) |
+| `gicp_num_threads` | `4` | GICP 스레드 수 |
+| `gicp_max_iterations` | `32` | 최대 반복 횟수 |
+| `downsample_resolution` | `0.1` | 다운샘플링 해상도 (m) |
+
+### 초기 위치 설정
+
+| 파라미터 | 기본값 | 설명 |
+|---------|-------|------|
+| `specify_init_pose` | `true` | 초기 위치 지정 여부 |
+| `init_pos_x` | `0.0` | 초기 X 좌표 (m) |
+| `init_pos_y` | `0.0` | 초기 Y 좌표 (m) |
+| `init_pos_z` | `0.0` | 초기 Z 좌표 (m) |
+| `init_ori_w` | `1.0` | 초기 방향 쿼터니언 w |
+| `init_ori_x` | `0.0` | 초기 방향 쿼터니언 x |
+| `init_ori_y` | `0.0` | 초기 방향 쿼터니언 y |
+| `init_ori_z` | `0.0` | 초기 방향 쿼터니언 z |
+
+### 로깅 설정
+
+| 파라미터 | 기본값 | 설명 |
+|---------|-------|------|
+| `log_dir` | `hdl_localization/Log` | 로그 저장 디렉토리 |
+
+## 출력 파일
+
+프로그램 종료 시 자동으로 `Log/` 폴더에 다음 파일들이 저장됩니다:
+
+### `traj_lidar.txt`
+추정된 궤적 파일 (TUM 형식):
+```
+timestamp tx ty tz qx qy qz qw
+```
+
+### `profiling_stats.txt`
+연산 시간 프로파일링 통계:
+
+**Localization 스레드 (20Hz)**:
+- `localization`: 전체 콜백 시간
+- `tf_transform`: TF 변환 시간
+- `downsample`: 다운샘플링 시간
+- `gicp`: Fast GICP 시간
+- `ukf_gicp`: UKF 보정 시간
+
+**Global Optimization 스레드 (1Hz)**:
+- `global_optimization`: 전체 NDT 처리 시간
+- `local_map_extract`: 로컬 맵 추출 시간
+- `ndt`: NDT 정합 시간
+- `ukf_ndt`: UKF 보정 시간
+
+## 토픽
+
+### 구독 토픽
+- `/points_topic` (sensor_msgs/PointCloud2): LiDAR 포인트클라우드
+- `/imu_topic` (sensor_msgs/Imu): IMU 데이터
+- `/globalmap` (sensor_msgs/PointCloud2): 글로벌 맵
+- `/initialpose` (geometry_msgs/PoseWithCovarianceStamped): 초기 위치 (RViz에서 설정 가능)
+
+### 발행 토픽
+- `/odom` (nav_msgs/Odometry): 추정된 오도메트리
+- `/aligned_points` (sensor_msgs/PointCloud2): 정렬된 포인트클라우드
+
+## 프로파일링 결과 예시
+
+### Localization (20Hz)
+| 항목 | 평균 | p95 | 최대 |
+|------|------|-----|------|
+| total | 20.22ms | 29.33ms | 104.89ms |
+| GICP | 14.30ms | 21.87ms | 45.00ms |
+| downsample | 0.34ms | 0.47ms | 0.59ms |
+
+### Global Optimization (1Hz)
+| 항목 | 평균 | p95 | 최대 |
+|------|------|-----|------|
+| total | 76.74ms | 81.25ms | 85.07ms |
+| local_map_extract | 39.56ms | 42.05ms | 43.70ms |
+| NDT | 22.42ms | 24.10ms | 27.44ms |
+
+## Docker 사용 (선택사항)
+
+Docker 환경에서 실행하려면:
+
+```bash
+# Docker 이미지 빌드
+cd docker
+docker build -t hdl-localization-ros2:latest .
+
+# 컨테이너 실행
+xhost +local:docker
+nvidia-docker run --privileged -it \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  --volume=/path/to/hdl-localization-ROS2:/root/workspace/src \
+  --volume=/tmp/.X11-unix:/tmp/.X11-unix:rw \
+  --net=host \
+  --ipc=host \
+  --name=hdl-localization-ros2 \
+  --env="DISPLAY=$DISPLAY" \
+  hdl-localization-ros2:latest /bin/bash
+```
 
 ## Acknowledgement
 
-We based ours on the following packages.    
-This repository just provides a detailed guide to using docker to reduce dependencies.  
+이 저장소는 다음 패키지들을 기반으로 합니다:
 
-- [DataspeedInc/hdl_localization](https://github.com/DataspeedInc/hdl_localization/tree/ros2)   
-- [DataspeedInc/hdl_global_localization](https://github.com/DataspeedInc/hdl_global_localization/tree/ros2)  
+- [DataspeedInc/hdl_localization](https://github.com/DataspeedInc/hdl_localization/tree/ros2)
+- [DataspeedInc/hdl_global_localization](https://github.com/DataspeedInc/hdl_global_localization/tree/ros2)
 - [DataspeedInc/fast_gicp](https://github.com/DataspeedInc/fast_gicp/tree/ros2)
-- [tier4/ndt_omp](https://github.com/tier4/ndt_omp)  
-
-
+- [tier4/ndt_omp](https://github.com/tier4/ndt_omp)

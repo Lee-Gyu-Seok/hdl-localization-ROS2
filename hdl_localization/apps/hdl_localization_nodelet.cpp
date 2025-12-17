@@ -6,9 +6,14 @@
 #include <mutex>
 #include <memory>
 #include <iostream>
+#include <fstream>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <algorithm>
+#include <filesystem>
+#include <iomanip>
+#include <cmath>
 
 #include <rclcpp/rclcpp.hpp>
 #include <pcl_ros/transforms.hpp>
@@ -45,6 +50,143 @@
 #include <hdl_global_localization/srv/query_global_localization.hpp>
 
 using namespace std;
+
+// ===========================================
+// Profiling Statistics Collector
+// ===========================================
+class ProfilingStats {
+public:
+  void addSample(const std::string& name, double time_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    samples_[name].push_back(time_ms);
+  }
+
+  void saveToFile(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::ofstream ofs(filepath);
+    if (!ofs.is_open()) {
+      return;
+    }
+
+    ofs << std::fixed << std::setprecision(3);
+    ofs << "# HDL Localization Profiling Statistics Report\n";
+    ofs << "# =================================\n\n";
+    ofs << "# Format: name | count | total(ms) | avg(ms) | min(ms) | max(ms) | p50(ms) | p95(ms) | p99(ms)\n\n";
+
+    double localization_total = 0.0;
+    double global_opt_total = 0.0;
+
+    // Localization thread stats
+    ofs << "# ----------------------------------------\n";
+    ofs << "# Thread: localization (LiDAR callback, 20Hz)\n";
+    ofs << "# ----------------------------------------\n\n";
+
+    std::vector<std::string> loc_names = {"localization", "tf_transform", "downsample", "gicp", "ukf_gicp"};
+    for (const auto& name : loc_names) {
+      auto it = samples_.find(name);
+      if (it != samples_.end() && !it->second.empty()) {
+        writeStats(ofs, name, it->second);
+        if (name == "localization") {
+          localization_total = std::accumulate(it->second.begin(), it->second.end(), 0.0);
+        }
+      }
+    }
+
+    // Global optimization thread stats
+    ofs << "# ----------------------------------------\n";
+    ofs << "# Thread: global_optimization (NDT thread, 1Hz)\n";
+    ofs << "# ----------------------------------------\n\n";
+
+    std::vector<std::string> opt_names = {"global_optimization", "local_map_extract", "ndt", "ukf_ndt"};
+    for (const auto& name : opt_names) {
+      auto it = samples_.find(name);
+      if (it != samples_.end() && !it->second.empty()) {
+        writeStats(ofs, name, it->second);
+        if (name == "global_optimization") {
+          global_opt_total = std::accumulate(it->second.begin(), it->second.end(), 0.0);
+        }
+      }
+    }
+
+    // Summary
+    ofs << "# ========================================\n";
+    ofs << "# Summary by Thread\n";
+    ofs << "# ========================================\n";
+    ofs << "localization: " << localization_total << " ms (" << (localization_total / 1000.0) << " sec)\n";
+    ofs << "global_optimization: " << global_opt_total << " ms (" << (global_opt_total / 1000.0) << " sec)\n";
+
+    ofs.close();
+  }
+
+private:
+  void writeStats(std::ofstream& ofs, const std::string& name, std::vector<double>& data) {
+    std::sort(data.begin(), data.end());
+    size_t n = data.size();
+    double total = std::accumulate(data.begin(), data.end(), 0.0);
+    double avg = total / n;
+    double min_val = data.front();
+    double max_val = data.back();
+    double p50 = data[n * 50 / 100];
+    double p95 = data[std::min(n - 1, n * 95 / 100)];
+    double p99 = data[std::min(n - 1, n * 99 / 100)];
+
+    ofs << name << "\n";
+    ofs << "  count:    " << n << "\n";
+    ofs << "  total:    " << total << " ms\n";
+    ofs << "  average:  " << avg << " ms\n";
+    ofs << "  min:      " << min_val << " ms\n";
+    ofs << "  max:      " << max_val << " ms\n";
+    ofs << "  p50:      " << p50 << " ms\n";
+    ofs << "  p95:      " << p95 << " ms\n";
+    ofs << "  p99:      " << p99 << " ms\n\n";
+  }
+
+  std::mutex mutex_;
+  std::map<std::string, std::vector<double>> samples_;
+};
+
+// ===========================================
+// Trajectory Logger
+// ===========================================
+class TrajectoryLogger {
+public:
+  void addPose(double timestamp, const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    poses_.push_back({timestamp, pos, quat});
+  }
+
+  void saveToFile(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::ofstream ofs(filepath);
+    if (!ofs.is_open()) {
+      return;
+    }
+
+    ofs << std::fixed << std::setprecision(6);
+    for (const auto& pose : poses_) {
+      // Format: timestamp tx ty tz qx qy qz qw
+      ofs << pose.timestamp << " "
+          << pose.pos.x() << " " << pose.pos.y() << " " << pose.pos.z() << " "
+          << pose.quat.x() << " " << pose.quat.y() << " " << pose.quat.z() << " " << pose.quat.w() << "\n";
+    }
+    ofs.close();
+  }
+
+  size_t size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return poses_.size();
+  }
+
+private:
+  struct PoseEntry {
+    double timestamp;
+    Eigen::Vector3f pos;
+    Eigen::Quaternionf quat;
+  };
+
+  mutable std::mutex mutex_;
+  std::vector<PoseEntry> poses_;
+};
 
 namespace hdl_localization {
 
@@ -134,6 +276,15 @@ public:
     ndt_thread_running = true;
     ndt_has_new_scan = false;
 
+    // Initialize logging
+    profiling_stats = std::make_shared<ProfilingStats>();
+    trajectory_logger = std::make_shared<TrajectoryLogger>();
+
+    // Create Log directory
+    log_dir = declare_parameter<std::string>("log_dir", "/home/q/colcon_ws/src/hdl-localization-ROS2/hdl_localization/Log");
+    std::filesystem::create_directories(log_dir);
+    RCLCPP_INFO(get_logger(), "Log directory: %s", log_dir.c_str());
+
     initialize_params();
 
     // Start NDT thread (runs at ndt_rate Hz)
@@ -142,6 +293,26 @@ public:
   }
 
   ~HdlLocalizationNodelet() {
+    // Ensure Log directory exists before saving
+    try {
+      std::filesystem::create_directories(log_dir);
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(get_logger(), "Failed to create log directory: %s", e.what());
+    }
+
+    // Save logs before shutdown
+    if (trajectory_logger && trajectory_logger->size() > 0) {
+      std::string traj_file = log_dir + "/traj_lidar.txt";
+      trajectory_logger->saveToFile(traj_file);
+      RCLCPP_INFO(get_logger(), "Saved trajectory to %s (%zu poses)", traj_file.c_str(), trajectory_logger->size());
+    }
+
+    if (profiling_stats) {
+      std::string stats_file = log_dir + "/profiling_stats.txt";
+      profiling_stats->saveToFile(stats_file);
+      RCLCPP_INFO(get_logger(), "Saved profiling stats to %s", stats_file.c_str());
+    }
+
     // Stop NDT thread
     ndt_thread_running = false;
     ndt_cv.notify_all();
@@ -325,6 +496,9 @@ private:
   // Points Callback - Frame-to-frame Fast GICP odometry (LiDAR rate)
   // ===========================================
   void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
+    // Start Localization timing (entire callback)
+    auto localization_start = std::chrono::high_resolution_clock::now();
+
     std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
     if (!pose_estimator) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5.0, "waiting for initial pose input!!");
@@ -348,6 +522,9 @@ private:
       return;
     }
 
+    // TF transform timing
+    auto tf_start = std::chrono::high_resolution_clock::now();
+
     // transform pointcloud into odom_child_frame_id
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
     if (!pcl_ros::transformPointCloud(odom_child_frame_id, *pcl_cloud, *cloud, *tf_buffer)) {
@@ -355,7 +532,14 @@ private:
       return;
     }
 
+    auto tf_end = std::chrono::high_resolution_clock::now();
+    double tf_time_ms = std::chrono::duration<double, std::milli>(tf_end - tf_start).count();
+
+    // Downsample timing
+    auto downsample_start = std::chrono::high_resolution_clock::now();
     auto filtered = downsample(cloud);
+    auto downsample_end = std::chrono::high_resolution_clock::now();
+    double downsample_time_ms = std::chrono::duration<double, std::milli>(downsample_end - downsample_start).count();
 
     if (relocalizing) {
       delta_estimater->add_frame(filtered);
@@ -402,6 +586,8 @@ private:
       auto icp_end = std::chrono::high_resolution_clock::now();
       double icp_time_ms = std::chrono::duration<double, std::milli>(icp_end - icp_start).count();
 
+      double ukf_time_ms = 0.0;
+
       if (frame_to_frame_gicp->hasConverged()) {
         Eigen::Matrix4f delta = frame_to_frame_gicp->getFinalTransformation();
         Eigen::Vector3f delta_trans = delta.block<3, 1>(0, 3);
@@ -428,14 +614,32 @@ private:
           // Convert frame-to-frame delta to absolute pose
           Eigen::Matrix4f gicp_pose = pose_estimator->matrix() * delta;
 
-          // UKF correction with GICP measurement
-          // Kalman gain optimally weights IMU prediction vs GICP measurement
+          // UKF correction timing
+          auto ukf_start = std::chrono::high_resolution_clock::now();
           pose_estimator->correct_gicp(gicp_pose, fitness);
+          auto ukf_end = std::chrono::high_resolution_clock::now();
+          ukf_time_ms = std::chrono::duration<double, std::milli>(ukf_end - ukf_start).count();
 
-          RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 200,
-            "GICP-UKF: delta=(%.4f, %.4f, %.4f), fitness=%.4f, src=%zu, tgt=%zu",
-            delta_trans.x(), delta_trans.y(), delta_trans.z(), fitness,
-            filtered->size(), prev_scan->size());
+          // Log detailed Localization timing
+          auto localization_end = std::chrono::high_resolution_clock::now();
+          double localization_total_ms = std::chrono::duration<double, std::milli>(localization_end - localization_start).count();
+
+          // Record profiling samples
+          profiling_stats->addSample("localization", localization_total_ms);
+          profiling_stats->addSample("tf_transform", tf_time_ms);
+          profiling_stats->addSample("downsample", downsample_time_ms);
+          profiling_stats->addSample("gicp", icp_time_ms);
+          profiling_stats->addSample("ukf_gicp", ukf_time_ms);
+
+          // Record trajectory with LiDAR timestamp
+          double lidar_timestamp = rclcpp::Time(stamp).seconds();
+          Eigen::Vector3f pos = pose_estimator->pos();
+          Eigen::Quaternionf quat = pose_estimator->quat();
+          trajectory_logger->addPose(lidar_timestamp, pos, quat);
+
+          RCLCPP_INFO(get_logger(),
+            "[Localization] total: %.2fms (TF: %.2f, DS: %.2f, GICP: %.2f, UKF: %.2f), fitness: %.4f",
+            localization_total_ms, tf_time_ms, downsample_time_ms, icp_time_ms, ukf_time_ms, fitness);
         } else {
           RCLCPP_WARN(get_logger(), "Fast-GICP: %.2fms, REJECTED (large delta: %.4f)",
             icp_time_ms, trans_norm);
@@ -508,7 +712,10 @@ private:
 
       // ===========================================
       // Perform NDT alignment to global map
+      // Start Global Optimization timing
       // ===========================================
+      auto global_opt_start = std::chrono::high_resolution_clock::now();
+
       std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
       if (!pose_estimator) continue;
 
@@ -519,9 +726,17 @@ private:
       Eigen::Vector3f current_pos = pose_estimator->pos();
 
       // Extract local map around current position for efficient NDT matching
+      auto local_map_start = std::chrono::high_resolution_clock::now();
+
       size_t local_map_size = 0;
+      double local_map_extract_ms = 0.0;
+      double local_map_downsample_ms = 0.0;
+
       if (use_local_map && globalmap_kdtree) {
         pcl::PointCloud<PointT>::Ptr local_map = extractLocalMap(current_pos, local_map_radius);
+        auto local_map_end = std::chrono::high_resolution_clock::now();
+        local_map_extract_ms = std::chrono::duration<double, std::milli>(local_map_end - local_map_start).count();
+
         if (local_map && local_map->size() > 100) {  // Minimum points threshold
           registration->setInputTarget(local_map);
           local_map_size = local_map->size();
@@ -550,14 +765,27 @@ private:
         // Apply NDT correction to UKF (reset drift)
         // Use correct_ndt to directly set UKF state to NDT result
         double ndt_score = registration->getFitnessScore();
+
+        // UKF correction timing
+        auto ukf_start = std::chrono::high_resolution_clock::now();
         pose_estimator->correct_ndt(ndt_result, ndt_score);
+        auto ukf_end = std::chrono::high_resolution_clock::now();
+        double ukf_time_ms = std::chrono::duration<double, std::milli>(ukf_end - ukf_start).count();
+
+        // Calculate total Global Optimization time
+        auto global_opt_end = std::chrono::high_resolution_clock::now();
+        double global_opt_total_ms = std::chrono::duration<double, std::milli>(global_opt_end - global_opt_start).count();
+
+        // Record profiling samples for Global Optimization
+        profiling_stats->addSample("global_optimization", global_opt_total_ms);
+        profiling_stats->addSample("local_map_extract", local_map_extract_ms);
+        profiling_stats->addSample("ndt", ndt_time_ms);
+        profiling_stats->addSample("ukf_ndt", ukf_time_ms);
 
         RCLCPP_INFO(get_logger(),
-          "NDT: %.2fms, pos: (%.3f, %.3f, %.3f), score: %.4f, pred_err: (%.3f, %.3f, %.3f), scan: %zu, localmap: %zu",
-          ndt_time_ms, ndt_pos.x(), ndt_pos.y(), ndt_pos.z(),
-          registration->getFitnessScore(),
-          pred_error.x(), pred_error.y(), pred_error.z(),
-          scan->size(), local_map_size);
+          "[GlobalOpt] total: %.2fms (LocalMap: %.2f, NDT: %.2f, UKF: %.2f), score: %.4f, pred_err: (%.3f, %.3f, %.3f)",
+          global_opt_total_ms, local_map_extract_ms, ndt_time_ms, ukf_time_ms,
+          ndt_score, pred_error.x(), pred_error.y(), pred_error.z());
 
         // Publish aligned points
         if (aligned_pub->get_subscription_count()) {
@@ -877,6 +1105,11 @@ private:
   double gyr_cov;
   double b_acc_cov;
   double b_gyr_cov;
+
+  // Logging
+  std::string log_dir;
+  std::shared_ptr<ProfilingStats> profiling_stats;
+  std::shared_ptr<TrajectoryLogger> trajectory_logger;
 };
 }  // namespace hdl_localization
 
