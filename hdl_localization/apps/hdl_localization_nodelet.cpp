@@ -548,13 +548,9 @@ private:
         Eigen::Vector3f pred_error = ndt_pos - pred_pos;
 
         // Apply NDT correction to UKF (reset drift)
-        // Create observation vector
-        Eigen::VectorXf observation(7);
-        observation.middleRows(0, 3) = ndt_pos;
-        observation.middleRows(3, 4) = Eigen::Vector4f(ndt_quat.w(), ndt_quat.x(), ndt_quat.y(), ndt_quat.z());
-
-        // Directly reset UKF state to NDT result (drift correction)
-        pose_estimator->correct(scan_stamp, scan);
+        // Use correct_ndt to directly set UKF state to NDT result
+        double ndt_score = registration->getFitnessScore();
+        pose_estimator->correct_ndt(ndt_result, ndt_score);
 
         RCLCPP_INFO(get_logger(),
           "NDT: %.2fms, pos: (%.3f, %.3f, %.3f), score: %.4f, pred_err: (%.3f, %.3f, %.3f), scan: %zu, localmap: %zu",

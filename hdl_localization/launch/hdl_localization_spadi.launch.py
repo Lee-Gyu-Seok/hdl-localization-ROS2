@@ -60,14 +60,14 @@ def generate_launch_description():
     robot_odom_frame_id = LaunchConfiguration("robot_odom_frame_id", default="odom")
 
     # Static TF: imu -> spadi/lidar (LiDAR-IMU extrinsic calibration)
-    # Translation: [-0.052, -0.083, -0.018] (x, y, z)
+    # Translation: [0.086, -0.062, 0.015] (x, y, z)
     # Rotation: Identity (quaternion: 0, 0, 0, 1)
     lidar_imu_tf = Node(
         name="lidar_imu_tf",
         package="tf2_ros",
         executable="static_transform_publisher",
         arguments=[
-            "-0.052", "-0.083", "-0.018",  # x, y, z translation
+            "0.086", "-0.062", "0.015",  # x, y, z translation
             "0", "0", "0", "1",             # quaternion (x, y, z, w)
             "imu", "spadi/lidar"            # parent_frame, child_frame
         ],
@@ -136,7 +136,7 @@ def generate_launch_description():
                     {"b_acc_cov": 0.0001}, # accelerometer bias noise covariance
                     {"b_gyr_cov": 0.0001}, # gyroscope bias noise covariance
                     # Timing
-                    {"cool_time_duration": 2.0},
+                    {"cool_time_duration": 0.5},  # Reduced for faster convergence
                     # Odometry prediction
                     {"enable_robot_odometry_prediction": enable_robot_odometry_prediction},
                     {"robot_odom_frame_id": robot_odom_frame_id},
@@ -146,17 +146,21 @@ def generate_launch_description():
                     {"ndt_neighbor_search_method": "DIRECT7"},
                     {"ndt_neighbor_search_radius": 2.0},
                     {"ndt_resolution": 1.0},  # Balance between precision and speed
+                    {"ndt_rate": 1.0},  # NDT at 1Hz for drift correction
                     # Downsampling
-                    {"downsample_resolution": 0.2},  # Sparser for faster computation
-                    # Initial pose: (0, 0, 0) facing forward
+                    {"downsample_resolution": 0.1},  # Finer for better GICP accuracy
+                    # Fast GICP parameters
+                    {"gicp_correspondence_distance": 0.3},  # Tighter matching
+                    # Initial pose: Set from GT trajectory start point
+                    # GT start: (-0.08, 0.05, -0.01) with quat (0.001, -0.003, -0.01, 0.9999)
                     {"specify_init_pose": True},
-                    {"init_pos_x": 0.0},
-                    {"init_pos_y": 0.0},
-                    {"init_pos_z": 0.0},
-                    {"init_ori_w": 1.0},  # No rotation (identity quaternion)
-                    {"init_ori_x": 0.0},
-                    {"init_ori_y": 0.0},
-                    {"init_ori_z": 0.0},
+                    {"init_pos_x": -0.08},
+                    {"init_pos_y": 0.05},
+                    {"init_pos_z": -0.01},
+                    {"init_ori_w": 0.999942},
+                    {"init_ori_x": 0.001105},
+                    {"init_ori_y": -0.003275},
+                    {"init_ori_z": -0.010235},
                     # Global localization
                     {"use_global_localization": use_global_localization},
                 ],

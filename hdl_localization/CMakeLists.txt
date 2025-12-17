@@ -49,13 +49,8 @@ set(KISS_ICP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../add/kiss-icp/cpp/kiss_icp)
 set(KISS_ICP_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../add/kiss-icp/cpp)
 include_directories(${KISS_ICP_INCLUDE_DIR})
 
-# Fetch tsl_robin (robin-map) dependency
-include(FetchContent)
-FetchContent_Declare(
-  tessil
-  URL https://github.com/Tessil/robin-map/archive/refs/tags/v1.4.0.tar.gz
-)
-FetchContent_MakeAvailable(tessil)
+# Use system-installed robin-map
+find_package(tsl-robin-map REQUIRED)
 
 # Build KISS-ICP core library
 add_library(kiss_icp_core STATIC

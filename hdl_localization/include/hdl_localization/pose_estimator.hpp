@@ -87,6 +87,16 @@ public:
   void correct_gicp(const Eigen::Matrix4f& gicp_pose, double fitness = 0.1);
 
   /**
+   * @brief Correct UKF state with NDT result (direct state reset for drift correction)
+   * @param ndt_pose  Pose from NDT alignment to global map
+   * @param score     NDT fitness score (lower = better)
+   *
+   * Unlike GICP which uses Kalman fusion, NDT directly resets the UKF state
+   * to eliminate accumulated drift from IMU and GICP.
+   */
+  void correct_ndt(const Eigen::Matrix4f& ndt_pose, double score);
+
+  /**
    * @brief correct
    * @param cloud   input cloud
    * @return cloud aligned to the globalmap

@@ -110,17 +110,8 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
  * @param gicp_pose  Absolute pose from GICP alignment
  * @param fitness    GICP fitness score (lower = better match)
  *
- * Standard tightly-coupled IMU-LiDAR sensor fusion:
- * - IMU predicts state at high rate (100Hz) via ukf->predict()
- * - GICP provides measurement at LiDAR rate (20Hz)
- * - UKF optimally fuses IMU prediction and GICP measurement via Kalman gain
- * - Kalman gain weights based on prediction uncertainty vs measurement noise
- *
- * Benefits over loosely-coupled (previous implementation):
- * - IMU prediction is not discarded, but optimally weighted
- * - High IMU rate provides smooth inter-LiDAR pose estimates
- * - GICP corrects IMU drift through proper Kalman update
- * - Covariance properly propagated for uncertainty estimation
+ * For frame-to-frame GICP odometry, we directly update the UKF state
+ * since GICP provides reliable relative motion estimates.
  */
 void PoseEstimator::correct_gicp(const Eigen::Matrix4f& gicp_pose, double fitness) {
   // Extract position and orientation from GICP result
@@ -134,32 +125,43 @@ void PoseEstimator::correct_gicp(const Eigen::Matrix4f& gicp_pose, double fitnes
     gicp_quat.coeffs() *= -1.0f;
   }
 
-  // Build observation vector [pos(3), quat(4)]
+  // Calculate velocity from position change
+  Eigen::Vector3f prev_pos = pos();
+  double dt = 0.05;  // Approximate LiDAR period (20Hz)
+  Eigen::Vector3f gicp_velocity = (gicp_pos - prev_pos) / dt;
+
+  // Directly set UKF state to GICP result for reliable odometry
+  // This ensures the pose follows GICP measurements closely
+  ukf->mean[0] = gicp_pos[0];
+  ukf->mean[1] = gicp_pos[1];
+  ukf->mean[2] = gicp_pos[2];
+  ukf->mean[3] = gicp_velocity[0];
+  ukf->mean[4] = gicp_velocity[1];
+  ukf->mean[5] = gicp_velocity[2];
+  ukf->mean[6] = gicp_quat.w();
+  ukf->mean[7] = gicp_quat.x();
+  ukf->mean[8] = gicp_quat.y();
+  ukf->mean[9] = gicp_quat.z();
+
+  // Also perform UKF correction for proper covariance update
   Eigen::VectorXf observation(7);
   observation.middleRows(0, 3) = gicp_pos;
   observation.middleRows(3, 4) = Eigen::Vector4f(gicp_quat.w(), gicp_quat.x(), gicp_quat.y(), gicp_quat.z());
 
-  // Adaptive measurement noise based on GICP fitness score
-  // Lower fitness = better match = lower noise = trust GICP more
+  // Very low measurement noise to trust GICP strongly
   // fitness typically ranges from 0.01 (good) to 1.0+ (poor)
-  double base_pos_noise = 0.01;   // Base position noise (m²)
-  double base_rot_noise = 0.001;  // Base rotation noise (rad²)
-  double noise_scale = std::max(1.0, fitness * 10.0);  // Scale by fitness
-
+  double noise_scale = std::max(0.1, fitness);
   Eigen::MatrixXf adaptive_measurement_noise = Eigen::MatrixXf::Identity(7, 7);
-  adaptive_measurement_noise.block<3, 3>(0, 0) *= base_pos_noise * noise_scale;
-  adaptive_measurement_noise.block<4, 4>(3, 3) *= base_rot_noise * noise_scale;
+  adaptive_measurement_noise.block<3, 3>(0, 0) *= 0.0001 * noise_scale;  // Position: ~1cm std
+  adaptive_measurement_noise.block<4, 4>(3, 3) *= 0.00001 * noise_scale; // Rotation: very small
 
-  // Store original measurement noise and apply adaptive noise
   Eigen::MatrixXf original_noise = ukf->getMeasurementNoiseCov();
   ukf->setMeasurementNoiseCov(adaptive_measurement_noise);
-
-  // UKF correction step - this computes Kalman gain and optimally fuses
-  // IMU prediction with GICP measurement
   ukf->correct(observation);
-
-  // Restore original measurement noise for NDT corrections
   ukf->setMeasurementNoiseCov(original_noise);
+
+  // Update last_observation for reference
+  last_observation = gicp_pose;
 
   // Update odom_ukf for compatibility
   if(!odom_ukf) {
@@ -177,6 +179,62 @@ void PoseEstimator::correct_gicp(const Eigen::Matrix4f& gicp_pose, double fitnes
   } else {
     odom_ukf->correct(observation);
   }
+}
+
+/**
+ * @brief Correct UKF state with NDT result (direct state reset for drift correction)
+ * @param ndt_pose  Pose from NDT alignment to global map
+ * @param score     NDT fitness score (lower = better)
+ *
+ * Unlike GICP which uses Kalman fusion, NDT directly resets the UKF state
+ * to eliminate accumulated drift from IMU and GICP.
+ */
+void PoseEstimator::correct_ndt(const Eigen::Matrix4f& ndt_pose, double score) {
+  // Extract position and orientation from NDT result
+  Eigen::Vector3f p = ndt_pose.block<3, 1>(0, 3);
+  Eigen::Quaternionf q(ndt_pose.block<3, 3>(0, 0));
+  q.normalize();
+
+  // Ensure quaternion sign consistency
+  if(quat().coeffs().dot(q.coeffs()) < 0.0f) {
+    q.coeffs() *= -1.0f;
+  }
+
+  // Calculate velocity from position change
+  Eigen::Vector3f prev_pos = pos();
+  double dt = 0.05;  // Approximate NDT period
+  Eigen::Vector3f ndt_velocity = (p - prev_pos) / dt;
+
+  // Directly set UKF state to NDT result (drift correction)
+  ukf->mean[0] = p[0];
+  ukf->mean[1] = p[1];
+  ukf->mean[2] = p[2];
+  ukf->mean[3] = ndt_velocity[0];
+  ukf->mean[4] = ndt_velocity[1];
+  ukf->mean[5] = ndt_velocity[2];
+  ukf->mean[6] = q.w();
+  ukf->mean[7] = q.x();
+  ukf->mean[8] = q.y();
+  ukf->mean[9] = q.z();
+
+  // Update last observation for next NDT initial guess
+  last_observation = ndt_pose;
+
+  // Also perform UKF correction for proper covariance update
+  Eigen::VectorXf observation(7);
+  observation.middleRows(0, 3) = p;
+  observation.middleRows(3, 4) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
+
+  // Adaptive measurement noise based on NDT score
+  double noise_scale = std::max(1.0, score * 2.0);
+  Eigen::MatrixXf adaptive_noise = Eigen::MatrixXf::Identity(7, 7);
+  adaptive_noise.block<3, 3>(0, 0) *= 0.001 * noise_scale;
+  adaptive_noise.block<4, 4>(3, 3) *= 0.0001 * noise_scale;
+
+  Eigen::MatrixXf original_noise = ukf->getMeasurementNoiseCov();
+  ukf->setMeasurementNoiseCov(adaptive_noise);
+  ukf->correct(observation);
+  ukf->setMeasurementNoiseCov(original_noise);
 }
 
 /**
