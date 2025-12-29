@@ -24,11 +24,6 @@ find_package(ndt_omp REQUIRED)
 find_package(fast_gicp REQUIRED)
 find_package(hdl_global_localization REQUIRED)
 
-# KISS-ICP dependencies
-find_package(Eigen3 REQUIRED)
-find_package(TBB REQUIRED)
-find_package(Sophus REQUIRED)
-
 find_package(PCL 1.7 REQUIRED)
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
@@ -43,33 +38,6 @@ if (OPENMP_FOUND)
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 endif()
-
-# KISS-ICP library
-set(KISS_ICP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../add/kiss-icp/cpp/kiss_icp)
-set(KISS_ICP_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../add/kiss-icp/cpp)
-include_directories(${KISS_ICP_INCLUDE_DIR})
-
-# Use system-installed robin-map
-find_package(tsl-robin-map REQUIRED)
-
-# Build KISS-ICP core library
-add_library(kiss_icp_core STATIC
-  ${KISS_ICP_DIR}/core/Registration.cpp
-  ${KISS_ICP_DIR}/core/VoxelHashMap.cpp
-  ${KISS_ICP_DIR}/core/VoxelUtils.cpp
-  ${KISS_ICP_DIR}/core/Preprocessing.cpp
-  ${KISS_ICP_DIR}/core/Threshold.cpp
-)
-target_include_directories(kiss_icp_core PUBLIC
-  ${KISS_ICP_INCLUDE_DIR}
-)
-target_link_libraries(kiss_icp_core PUBLIC
-  Eigen3::Eigen
-  TBB::tbb
-  Sophus::Sophus
-  tsl::robin_map
-)
-set_target_properties(kiss_icp_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 ########################
 ## message generation ##
@@ -114,11 +82,6 @@ rosidl_target_interfaces(${PROJECT_NAME}_lib
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
-  ${KISS_ICP_INCLUDE_DIR}
-)
-target_link_libraries(${PROJECT_NAME}_lib
-  kiss_icp_core
-  Sophus::Sophus
 )
 rclcpp_components_register_node(${PROJECT_NAME}_lib
   PLUGIN "${PROJECT_NAME}::HdlLocalizationNodelet"

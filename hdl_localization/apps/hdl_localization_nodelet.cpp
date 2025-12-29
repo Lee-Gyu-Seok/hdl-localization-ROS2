@@ -388,7 +388,7 @@ private:
     gicp->setNumThreads(gicp_num_threads);
     gicp->setMaximumIterations(gicp_max_iterations);
     gicp->setMaxCorrespondenceDistance(gicp_correspondence_distance);
-    gicp->setTransformationEpsilon(1e-4);  // Looser epsilon for faster convergence
+    gicp->setTransformationEpsilon(1e-6);  // Tighter epsilon for better accuracy
     frame_to_frame_gicp = gicp;
 
     RCLCPP_INFO(get_logger(), "Fast GICP params - threads: %d, max_iter: %d, corr_dist: %.2f",

@@ -146,7 +146,7 @@ def generate_launch_description():
                     {"ndt_neighbor_search_method": "DIRECT7"},
                     {"ndt_neighbor_search_radius": 2.0},
                     {"ndt_resolution": 1.0},  # Balance between precision and speed
-                    {"ndt_rate": 1.0},  # NDT at 1Hz for drift correction
+                    {"ndt_rate": 2.0},  # NDT at 2Hz for faster drift correction
                     # Downsampling
                     {"downsample_resolution": 0.1},  # Finer for better GICP accuracy
                     # Fast GICP parameters
